@@ -1,0 +1,36 @@
+{
+  "render": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "crf": 22,
+    "preset": "veryfast",
+    "audio_bitrate": "160k",
+    "audio_rate_hz": 44100,
+    "fade_from_black_secs": 10.0,
+    "seamless_loop": true,
+    "crop_to_fill": true,
+    "black_frame_threshold": 30,
+    "black_frame_flatness": 12,
+    "thumb_at_secs": null
+  },
+  "publish": {
+    "hour": 22,
+    "minute": 0,
+    "timezone": "Asia/Omsk",
+    "workers": null,
+    "upload_retries": 3,
+    "retry_base_delay_secs": 5,
+    "fix_black_thumbnail": true,
+    "delete_after_upload": true,
+    "horizon_days": 1,
+    "stream_to_upload": true
+  },
+  "api": {
+    "insert_bucket_per_day": 100,
+    "general_units_per_day": 10000,
+    "quota_warn_percent": 85,
+    "max_parallel_uploads": 4
+  },
+  "log_level": null
+}

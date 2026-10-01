@@ -87,10 +87,21 @@ fn default_root() -> Result<PathBuf> {
     )
 }
 
-/// Ищем ffmpeg: сперва рядом с проектом (`tools/ffmpeg/**/bin`), потом в PATH
+/// Ищем ffmpeg: сперва рядом с проектом (`tools/ffmpeg/**`), потом в PATH.
+/// Папки macos/windows/linux внутри tools/ffmpeg фильтруются по текущей ОС,
+/// чтобы не подхватить бинарник чужой платформы.
 fn find_ffmpeg(root: &Path) -> Result<(PathBuf, PathBuf)> {
     let mut ff = None;
     let mut fp = None;
+
+    let want_exe = cfg!(windows);
+    let this_os: &str = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "linux"
+    };
 
     let tools = root.join("tools").join("ffmpeg");
     if tools.exists() {
@@ -99,14 +110,30 @@ fn find_ffmpeg(root: &Path) -> Result<(PathBuf, PathBuf)> {
             if !entry.file_type().is_file() {
                 continue;
             }
-            match entry.file_name().to_string_lossy().as_ref() {
-                "ffmpeg.exe" | "ffmpeg" if ff.is_none() => {
-                    ff = Some(entry.path().to_path_buf())
+            // пропускаем бинарники чужих платформ
+            let foreign_platform = entry
+                .path()
+                .components()
+                .any(|c| {
+                    let s = c.as_os_str().to_string_lossy();
+                    matches!(s.as_ref(), "macos" | "windows" | "linux") && s != this_os
+                });
+            if foreign_platform {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if want_exe {
+                match name.as_ref() {
+                    "ffmpeg.exe" if ff.is_none() => ff = Some(entry.path().to_path_buf()),
+                    "ffprobe.exe" if fp.is_none() => fp = Some(entry.path().to_path_buf()),
+                    _ => {}
                 }
-                "ffprobe.exe" | "ffprobe" if fp.is_none() => {
-                    fp = Some(entry.path().to_path_buf())
+            } else if !name.ends_with(".exe") {
+                match name.as_ref() {
+                    "ffmpeg" if ff.is_none() => ff = Some(entry.path().to_path_buf()),
+                    "ffprobe" if fp.is_none() => fp = Some(entry.path().to_path_buf()),
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }

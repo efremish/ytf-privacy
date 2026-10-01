@@ -1,22 +1,22 @@
 # Rust
 ytf/target/
 
-# Временные рендеры
+# Р’СЂРµРјРµРЅРЅС‹Рµ СЂРµРЅРґРµСЂС‹
 .work/
 
-# Секреты — не в репозиторий
+# РЎРµРєСЂРµС‚С‹ вЂ” РЅРµ РІ СЂРµРїРѕР·РёС‚РѕСЂРёР№
 tokens.json
 client_secret.json
 auth/client_secret*.json
 token.json
 tokens.txt
 
-# Контент каналов (личные данные и медиа)
+# РљРѕРЅС‚РµРЅС‚ РєР°РЅР°Р»РѕРІ (Р»РёС‡РЅС‹Рµ РґР°РЅРЅС‹Рµ Рё РјРµРґРёР°)
 People/
 upload_history.json
 upload_links.txt
 
-# Состояние
+# РЎРѕСЃС‚РѕСЏРЅРёРµ
 state.json
 used.json
 history.json
@@ -25,6 +25,11 @@ report.html
 # ffmpeg
 tools/ffmpeg/
 
-# Прочее
+# РџСЂРѕС‡РµРµ
 .mimocode/
 site/
+
+# pack binaries (в ZIP входят, в git нет)
+ytf/pack/tools/
+ytf/pack/ytf-macos
+ytf/pack/ytf.exe
