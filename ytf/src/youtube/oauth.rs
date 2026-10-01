@@ -1,7 +1,7 @@
 use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
 use std::io::Write;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::process::Stdio;
 
 use crate::settings::Context;
 use crate::tokens::TokenStore;
@@ -22,15 +22,16 @@ struct TokenResp {
     error_description: Option<String>,
 }
 
-/// Получить refresh_token для папки канала.
+/// Получить refresh_token для папки канала (схема «перенос ссылки»).
 ///
-/// Схема максимально простая для пользователя:
-///   1. программа поднимает локальный сервер-перехватчик на 127.0.0.1:<случайный порт>
-///   2. печатает ссылку Google и открывает её в браузере по умолчанию
-///      (или ссылку вставляют в браузер профиля канала в Nstbrowser)
-///   3. пользователь нажимает «Продолжить»/«Allow»
-///   4. Google перебрасывает на http://localhost:<порт>/?code=... —
-///      код программа ловит САМА, копировать ничего не нужно
+/// Работает с любым браузером, включая профили Nstbrowser с прокси:
+///   1. программа печатает ссылку Google и кладёт её в буфер обмена
+///   2. пользователь вставляет ссылку в ОКНО ПРОФИЛЯ канала (Nstbrowser)
+///      или в браузер, где залогинен аккаунт канала
+///   3. нажимает «Продолжить» / «Allow»
+///   4. браузер покажет «страница недоступна» — это норма: в адресной
+///      строке будет http://localhost/?code=...
+///   5. пользователь копирует адрес из строки и вставляет в программу
 pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()> {
     let cs = ctx.root.join("client_secret.json");
     if !cs.exists() {
@@ -52,11 +53,7 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
     ];
     let scope_q = urlencode(&scopes.join(" "));
 
-    // локальный перехватчик ответа Google
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let redirect = format!("http://localhost:{port}");
-
+    let redirect = "http://localhost";
     let url = format!(
         "https://accounts.google.com/o/oauth2/auth\
          ?client_id={}\
@@ -66,38 +63,51 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
          &access_type=offline\
          &prompt=consent",
         urlencode(&client_id),
-        urlencode(&redirect),
+        urlencode(redirect),
         scope_q
     );
 
-    println!("\n  Выдача доступа каналу: {folder}\n");
-    println!("  Проект Google Cloud: {project}\n");
-    println!("  ─────────────────────────────────────────────────────────────");
-    println!("  1. Открой ЭТУ ссылку в браузере аккаунта канала");
-    println!("     (если канал заведён в Nstbrowser — открой ссылку в окне");
-    println!("      ПРОФИЛЯ этого канала):");
+    println!("\n  Подключение канала: {folder}");
+    println!("  Проект Google Cloud: {project}");
+    println!("  ────────────────────────────────────────────────────────────────");
+    println!("  ШАГ 1. Ссылка для разрешения доступа (она УЖЕ в буфере обмена):");
     println!();
     println!("  {url}");
     println!();
-    println!("  2. Нажми «Продолжить» / «Allow» (если Google предупреждает, что");
-    println!("     приложение не проверено: «Дополнительные настройки» →");
-    println!("     «Перейти на ...» → «Продолжить»).");
-    println!("  3. Дальше ВСЁ АВТОМАТИЧЕСКИ: страница сама сообщит об успехе.");
-    println!("  ─────────────────────────────────────────────────────────────\n");
+    println!("  ШАГ 2. Вставь эту ссылку в адресную строку ОКНА ПРОФИЛЯ КАНАЛА");
+    println!("         в Nstbrowser (где залогинен нужный YouTube-аккаунт)");
+    println!("         и открой. Подойдёт и обычный браузер с этим аккаунтом.");
+    println!();
+    println!("  ШАГ 3. Нажми «Продолжить» / «Allow».");
+    println!("         Если Google предупреждает «приложение не проверено»:");
+    println!("         «Дополнительные настройки» → «Перейти на страницу (небезопасно)»");
+    println!("         → «Продолжить».");
+    println!();
+    println!("  ШАГ 4. Браузер покажет «страница недоступна» — ЭТО НОРМАЛЬНО.");
+    println!("         В адресной строке будет адрес вида");
+    println!("         http://localhost/?code=4/0AX...&scope=...");
+    println!();
+    println!("  ШАГ 5. Скопируй ВЕСЬ адрес из строки браузера и вставь сюда.");
+    println!("  ────────────────────────────────────────────────────────────────\n");
 
-    // пробуем открыть браузер по умолчанию (удобно, если нужный аккаунт уже там)
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", &url])
-        .spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    copy_to_clipboard(&url);
+    println!("  (ссылка скопирована в буфер обмена — просто Ctrl+V / Cmd+V)\n");
 
-    println!("  Жду разрешения (после нажатия «Продолжить» всё случится само)...\n");
-    let code = wait_for_code(&listener).await?;
-    println!("  ✓ Код получен, меняю на токен...");
+    print!("  Вставь адрес сюда и нажми Enter: ");
+    std::io::stdout().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let pasted = input.trim();
+
+    if pasted.is_empty() {
+        bail!("пустая строка — запускай заново");
+    }
+    let code = extract_code(pasted)
+        .ok_or_else(|| anyhow::anyhow!("в вставленном тексте не нашлось ?code=... — убедись, \
+                 что копируешь адрес ПОСЛЕ нажатия «Продолжить»"))?;
+
+    println!("\n  ✓ Код принят, меняю на токен...");
 
     let client = super::auth::http_client()?;
     let resp = client
@@ -106,7 +116,7 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
             ("code", code.as_str()),
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
-            ("redirect_uri", redirect.as_str()),
+            ("redirect_uri", redirect),
             ("grant_type", "authorization_code"),
         ])
         .send()
@@ -143,71 +153,54 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
     store.save(ctx)?;
 
     println!("\n  Записано в {}", ctx.tokens_file().display());
-    println!("  Проверяю...\n");
+    println!("  Проверяю канал...\n");
     crate::tokens::check_all(ctx).await?;
     Ok(())
 }
 
-/// Принять один ответ Google на локальном сервере и вытащить ?code=
-async fn wait_for_code(listener: &tokio::net::TcpListener) -> Result<String> {
-    const OK_PAGE: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-        Connection: close\r\n\r\n<!doctype html><html><head><meta charset=utf-8>\
-        <title>Готово</title></head><body style=\"font-family:sans-serif;text-align:center;\
-        padding-top:60px\"><h2>✓ Токен получен</h2><p>Эту вкладку можно закрыть,\
-        всё сохранилось в программе.</p></body></html>";
-    const DENY_PAGE: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-        Connection: close\r\n\r\n<!doctype html><html><head><meta charset=utf-8>\
-        <title>Отказ</title></head><body style=\"font-family:sans-serif;text-align:center;\
-        padding-top:60px\"><h2>Доступ не выдан</h2><p>Вернись в терминал — там подробности.\
-        Эту вкладку можно закрыть.</p></body></html>";
-    const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\
-        Content-Length: 0\r\n\r\n";
-
-    loop {
-        let (mut sock, _) = listener.accept().await?;
-        let mut buf = vec![0u8; 16384];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        if n == 0 {
-            continue;
+/// Скопировать ссылку в буфер обмена (best-effort, ошибка не критична).
+fn copy_to_clipboard(s: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = std::process::Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(s.as_bytes());
+                drop(si);
+                let _ = child.wait();
+            }
         }
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let line = req.lines().next().unwrap_or("");
-        // "GET /?code=...&scope=... HTTP/1.1"
-        let Some(path) = line.split_whitespace().nth(1) else {
-            let _ = sock.write_all(NOT_FOUND.as_bytes()).await;
-            continue;
-        };
-
-        if let Some(code) = extract_code(path) {
-            let _ = sock.write_all(OK_PAGE.as_bytes()).await;
-            let _ = sock.flush().await;
-            return Ok(code);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(mut child) = std::process::Command::new("cmd")
+            .args(["/c", "clip"])
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(s.as_bytes());
+                drop(si);
+                let _ = child.wait();
+            }
         }
-        if let Some(err) = capture_error(path) {
-            let _ = sock.write_all(DENY_PAGE.as_bytes()).await;
-            let _ = sock.flush().await;
-            bail!("Google вернул отказ: {err}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mut child) = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(s.as_bytes());
+                drop(si);
+                let _ = child.wait();
+            }
         }
-        // favicon и прочий шум — просто 404 и ждём дальше
-        let _ = sock.write_all(NOT_FOUND.as_bytes()).await;
     }
 }
 
-fn capture_error(path: &str) -> Option<String> {
-    let q = path.split('?').nth(1)?;
-    for pair in q.split('&') {
-        if let Some(v) = pair.strip_prefix("error=") {
-            let desc = q
-                .split('&')
-                .find_map(|p| p.strip_prefix("error_description="))
-                .unwrap_or("");
-            let desc = urldecode(desc);
-            return Some(format!("{} {}", urldecode(v), desc).trim().to_string());
-        }
-    }
-    None
-}
-
+/// Вытащить ?code= из вставленного адреса (или принять голый код "4/xxx")
 fn extract_code(s: &str) -> Option<String> {
     if let Some(i) = s.find("code=") {
         let rest = &s[i + 5..];
@@ -220,6 +213,22 @@ fn extract_code(s: &str) -> Option<String> {
     // некоторые клиенты отдают код в виде 4/xxxx
     if s.starts_with("4/") && s.len() > 2 {
         return Some(s.to_string());
+    }
+    None
+}
+
+/// Вытащить error= из вставленного адреса, чтобы объяснить отказ
+fn capture_error(s: &str) -> Option<String> {
+    let q = s.split('?').nth(1)?;
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("error=") {
+            let desc = q
+                .split('&')
+                .find_map(|p| p.strip_prefix("error_description="))
+                .unwrap_or("");
+            let desc = urldecode(desc);
+            return Some(format!("{} {}", urldecode(v), desc).trim().to_string());
+        }
     }
     None
 }
@@ -275,16 +284,21 @@ mod tests {
     #[test]
     fn код_из_url_вытаскивается() {
         assert_eq!(
-            extract_code("/?code=4%2F0AXabc&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube.upload"),
+            extract_code("http://localhost/?code=4%2F0AXabc&scope=https%3A%2F%2Fwww.googleapis.com"),
             Some("4/0AXabc".into())
         );
-        assert_eq!(extract_code("/favicon.ico"), None);
+        assert_eq!(extract_code("http://localhost/?state=x&error=access_denied"), None);
+    }
+
+    #[test]
+    fn голый_код_тоже_принимается() {
+        assert_eq!(extract_code("4/0AXabc-XYZ"), Some("4/0AXabc-XYZ".into()));
     }
 
     #[test]
     fn ошибка_вытаскивается() {
         assert_eq!(
-            capture_error("/?error=access_denied&error_description=User%20denied"),
+            capture_error("http://localhost/?error=access_denied&error_description=User%20denied"),
             Some("access_denied User denied".into())
         );
     }
