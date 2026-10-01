@@ -1,0 +1,30 @@
+# Rust
+ytf/target/
+
+# Временные рендеры
+.work/
+
+# Секреты — не в репозиторий
+tokens.json
+client_secret.json
+auth/client_secret*.json
+token.json
+tokens.txt
+
+# Контент каналов (личные данные и медиа)
+People/
+upload_history.json
+upload_links.txt
+
+# Состояние
+state.json
+used.json
+history.json
+report.html
+
+# ffmpeg
+tools/ffmpeg/
+
+# Прочее
+.mimocode/
+site/

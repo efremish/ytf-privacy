@@ -1,0 +1,51 @@
+[package]
+name = "ytf"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "YouTube type-beat publishing pipeline: render + upload + schedule"
+
+[[bin]]
+name = "ytf"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# http
+axum = { version = "0.7", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls", "http2"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# errors / logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# media
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# time
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono-tz = "0.10"
+
+# misc
+rand = "0.8"
+walkdir = "2"
+futures-util = "0.3"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
