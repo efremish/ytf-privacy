@@ -9,7 +9,7 @@
     "audio_rate_hz": 44100,
     "fade_from_black_secs": 10.0,
     "seamless_loop": true,
-    "crop_to_fill": true,
+    "crop_to_fill": false,
     "black_frame_threshold": 30,
     "black_frame_flatness": 12,
     "thumb_at_secs": null

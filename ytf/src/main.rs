@@ -1,11 +1,13 @@
 mod config;
 mod library;
+mod logfile;
 mod media;
 mod metadata;
 mod pipeline;
 mod plan;
 mod report;
 mod settings;
+mod shorts;
 mod tokens;
 mod web;
 mod youtube;
@@ -72,9 +74,24 @@ enum Cmd {
         #[arg(long)]
         no_upload: bool,
     },
+    /// Залить готовые шортсы из Shorts/<канал>/ (без рендера)
+    Shorts {
+        /// канал (имя папки в Shorts/). Без флага — все
+        channel: Option<String>,
+        /// показать план, но ничего не загружать
+        #[arg(long)]
+        no_upload: bool,
+    },
     /// Проверить, считает ли система кадр чёрным (диагностика обложки)
     CheckThumb {
         /// путь к видео или к jpg
+        file: String,
+    },
+    /// Залить свою обложку на конкретное видео (id + jpg)
+    SetThumb {
+        /// id видео из ссылки watch?v=ID
+        video_id: String,
+        /// путь к jpg (рекомендуется 1280x720)
         file: String,
     },
     /// Веб-интерфейс
@@ -87,14 +104,6 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("YTF_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -103,7 +112,11 @@ fn main() -> Result<()> {
 
     rt.block_on(async move {
         let ctx = settings::Context::new(cli.root)?;
-        match cli.cmd {
+        // логи: консоль + logs/ytf-<дата>.log (ротация по дням)
+        let log_path = logfile::init(&ctx.root);
+        println!("логи: {}\n", log_path.display());
+
+        let res = match cli.cmd {
             Cmd::Doctor => pipeline::doctor(&ctx).await,
             Cmd::Library => library::print_library(&ctx),
             Cmd::Tokens => tokens::check_all(&ctx).await,
@@ -114,7 +127,11 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Cmd::Auth { folder, title } => youtube::oauth::run(&ctx, &folder, title.as_deref()).await,
+            Cmd::Shorts { channel, no_upload } => {
+                shorts::publish(&ctx, channel.as_deref(), no_upload).await
+            }
             Cmd::CheckThumb { file } => pipeline::check_thumb(&ctx, &file).await,
+            Cmd::SetThumb { video_id, file } => pipeline::set_thumb(&ctx, &video_id, &file).await,
             Cmd::Quota => youtube::quota::print_quota(&ctx).await,
             Cmd::Publish { channel, randomize, horizon, workers, no_upload } => {
                 pipeline::publish(&ctx, channel.as_deref(), randomize, horizon, workers, no_upload).await
@@ -123,6 +140,11 @@ fn main() -> Result<()> {
                 pipeline::publish(&ctx, None, randomize, horizon, workers, no_upload).await
             }
             Cmd::Web { port, host } => web::serve(&ctx, &host, port).await,
+        };
+        // любая ошибка верхнего уровня должна остаться в лог-файле
+        if let Err(e) = &res {
+            tracing::error!("{e:#}");
         }
+        res
     })
 }

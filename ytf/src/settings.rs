@@ -65,7 +65,7 @@ impl Context {
 /// Корень по умолчанию: два уровня выше от бинарника.
 ///   <root>/ytf/target/release/ytf.exe  ->  <root>
 ///   <root>/ytf/ytf                     ->  <root>
-fn default_root() -> Result<PathBuf> {
+pub fn default_root() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("не найти путь к себе")?;
     let mut dir = exe.parent().map(Path::to_path_buf);
 

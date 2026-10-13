@@ -119,9 +119,18 @@ pub async fn publish(
     while let Some(res) = set.join_next().await {
         done += 1;
         match res {
-            Ok((_, Ok(line))) => println!("  [{done}] {line}"),
-            Ok((_, Err(e))) => println!("  [{done}] ошибка: {e:#}"),
-            Err(e) => println!("  [{done}] паника в задаче: {e}"),
+            Ok((_, Ok(line))) => {
+                tracing::info!("{line}");
+                println!("  [{done}] {line}");
+            }
+            Ok((_, Err(e))) => {
+                tracing::error!("канал завершился ошибкой: {e:#}");
+                println!("  [{done}] ошибка: {e:#}");
+            }
+            Err(e) => {
+                tracing::error!("паника в задаче: {e}");
+                println!("  [{done}] паника в задаче: {e}");
+            }
         }
     }
 
@@ -379,16 +388,20 @@ async fn run_one(
 /// иначе при стриминге файла уже нет
 async fn make_thumbnail(r: &Renderer, visual: &Visual) -> Result<Vec<u8>> {
     let c = r.cfg();
+    // геометрия должна совпадать с рендером (media.rs): при crop_to_fill=false
+    // центр-квадрат источника вписывается по высоте, по бокам чёрные поля
     let geom = if c.crop_to_fill {
         format!(
             "scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}",
             w = c.width, h = c.height
         )
     } else {
+        let s = c.width.min(c.height);
         format!(
-            "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
+            "scale={s}:{s}:force_original_aspect_ratio=increase:flags=lanczos,\
+             crop={s}:{s},\
              pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
-            w = c.width, h = c.height
+            w = c.width, h = c.height, s = s
         )
     };
 
@@ -438,8 +451,24 @@ async fn fix_thumbnail(
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(4 * attempt as u64)).await;
         }
-        let Ok(Some(url)) = api::video_thumb_url(session, video_id).await else { continue };
-        let Ok(bytes) = api::fetch_thumb_bytes(&url).await else { continue };
+        let url = match api::video_thumb_url(session, video_id).await {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                tracing::info!("обложка {video_id}: превью ещё не сгенерировано (попытка {attempt})");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("обложка {video_id}: videos.list не ответил (попытка {attempt}): {e}");
+                continue;
+            }
+        };
+        let bytes = match api::fetch_thumb_bytes(&url).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("обложка {video_id}: не скачал превью (попытка {attempt}): {e}");
+                continue;
+            }
+        };
 
         if !Renderer::frame_is_black(&bytes, max_luma, max_spread) {
             tracing::info!("обложка {video_id} нормальная — оставляю YouTube");
@@ -454,6 +483,7 @@ async fn fix_thumbnail(
             }
         }
     }
+    tracing::warn!("обложка {video_id}: не удалось проверить превью за 4 попытки — оставляю как есть");
     false
 }
 
@@ -505,11 +535,63 @@ pub async fn check_thumb(ctx: &Context, file: &str) -> Result<()> {
     Ok(())
 }
 
+/// Залить свою обложку на видео вручную: `ytf setthumb <video_id> <jpg>`.
+/// Пробует токены по очереди, пока один не сойдётся с каналом видео.
+pub async fn set_thumb(ctx: &Context, video_id: &str, file: &str) -> Result<()> {
+    let store = TokenStore::load(ctx)?;
+    if store.channels.is_empty() {
+        anyhow::bail!("нет токенов в tokens.json");
+    }
+    let bytes = std::fs::read(file).map_err(|e| anyhow::anyhow!("не прочитать {file}: {e}"))?;
+    tracing::info!("setthumb: {video_id} <- {file} ({} байт, {} токенов)",
+        bytes.len(), store.channels.len());
+
+    // что на обложке сейчас (любым токеном — чтение публичное)
+    for t in store.channels.values() {
+        let mut tm = TokenManager::new(t);
+        if let Ok(s) = tm.session().await {
+            if let Ok(Some(u)) = api::video_thumb_url(&s, video_id).await {
+                println!("текущая обложка: {u}");
+                break;
+            }
+        }
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for (folder, t) in &store.channels {
+        let mut tm = TokenManager::new(t);
+        let s = match tm.session().await {
+            Ok(s) => s,
+            Err(e) => { println!("  {folder}: сессия не получена ({e})"); continue; }
+        };
+        match api::set_thumbnail(&s, video_id, bytes.clone()).await {
+            Ok(()) => {
+                println!("[OK] обложка залита (токен папки «{folder}»)");
+                tracing::info!("setthumb: {video_id} залита, токен {folder}");
+                // YouTube обновляет URL не мгновенно
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Ok(Some(u)) = api::video_thumb_url(&s, video_id).await {
+                    println!("обложка после обновления: {u}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                println!("  {folder}: не подошёл — {e}");
+                tracing::warn!("setthumb[{folder}]: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    anyhow::bail!("ни один токен не подошёл для {video_id} — {}",
+        last_err.map(|e| e.to_string()).unwrap_or_default())
+}
+
 // ── doctor ────────────────────────────────────────────────
 
 pub async fn doctor(ctx: &Context) -> Result<()> {
     println!("=== YTF: проверка окружения ===\n");
     println!("Корень       : {}", ctx.root.display());
+    println!("логи         : {}", ctx.root.join("logs").display());
     println!("settings.json: {}", if ctx.settings_file().exists() { "есть" } else { "НЕТ (будут дефолты)" });
     println!("ffmpeg       : {}", ctx.ffmpeg.display());
     println!("ffprobe      : {}", ctx.ffprobe.display());

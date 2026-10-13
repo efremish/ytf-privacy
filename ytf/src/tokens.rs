@@ -150,6 +150,10 @@ pub async fn check_all(ctx: &Context) -> Result<()> {
 
     let mut ok = 0;
     let mut bad = 0;
+    // channel_id -> папки, которые на него указывают: помогает найти
+    // случай, когда две папки привязаны к ОДНОМУ каналу (почта с
+    // несколькими каналами, на экране Google выбрали не тот)
+    let mut by_channel: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
     for (folder, tok) in &store.channels {
         match crate::youtube::auth::probe_channel(tok).await {
             Ok(info) => {
@@ -159,6 +163,8 @@ pub async fn check_all(ctx: &Context) -> Result<()> {
                     "[OK] {folder} -> {} (videoId канала: {}){warn}",
                     info.title, info.channel_id
                 );
+                tracing::info!("tokens: {folder} -> {} ({})", info.title, info.channel_id);
+                by_channel.entry(info.channel_id.clone()).or_default().push(folder.clone());
                 if !need_upload {
                     bad += 1;
                 } else {
@@ -167,8 +173,23 @@ pub async fn check_all(ctx: &Context) -> Result<()> {
             }
             Err(e) => {
                 println!("[FAIL] {folder}: {e}");
+                tracing::error!("tokens: {folder} -> {e:#}");
                 bad += 1;
             }
+        }
+    }
+    for (channel, folders) in &by_channel {
+        if folders.len() > 1 {
+            println!(
+                "\n[!] ВНИМАНИЕ: папки {} все указывают на ОДИН канал ({})!",
+                folders.join(", "),
+                channel
+            );
+            println!("    Значит при подключении второй папки был выбран тот же канал.");
+            println!("    Как исправить: открой ссылку auth в окне нужного канала");
+            println!("    (см. ШАГ 2b в `ytf auth`), получи токен заново для каждой папки.");
+            tracing::warn!("tokens: дубль канала {channel}: {}", folders.join(", "));
+            bad += folders.len();
         }
     }
     println!("\nГотово: {ok}, проблем: {bad}");

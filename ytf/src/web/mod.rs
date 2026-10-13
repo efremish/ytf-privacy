@@ -38,6 +38,7 @@ pub struct RunInfo {
 impl RunInfo {
     pub fn push(&mut self, line: impl Into<String>) {
         let l = line.into();
+        tracing::info!("web: {l}");
         self.current = Some(l.clone());
         self.log.push(l);
         if self.log.len() > 400 {
@@ -56,6 +57,8 @@ pub async fn serve(ctx: &Context, host: &str, port: u16) -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/api/state", get(api_state))
         .route("/api/publish", post(api_publish))
+        .route("/api/shorts", get(api_shorts))
+        .route("/api/shorts/publish", post(api_shorts_publish))
         .route("/api/settings", get(api_get_settings).put(api_put_settings))
         .route("/api/history", get(api_history))
         .route("/api/tokens", get(api_tokens))
@@ -204,6 +207,69 @@ async fn api_publish(
     (StatusCode::OK, Json(serde_json::json!({ "started": true }))).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct ShortsReq {
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+/// Список папок Shorts/ и что в них лежит
+async fn api_shorts(State(s): State<AppState>) -> impl IntoResponse {
+    let list: Vec<_> = crate::shorts::scan(&s.ctx)
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "folder": c.folder,
+                "files": c.pending.iter().map(|p|
+                    p.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>(),
+                "count": c.pending.len(),
+                "has_token": c.has_token,
+                "description": c.cfg.description,
+                "tags": c.cfg.tags.len(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "channels": list })).into_response()
+}
+
+async fn api_shorts_publish(
+    State(s): State<AppState>,
+    Json(req): Json<ShortsReq>,
+) -> impl IntoResponse {
+    {
+        let mut run = s.run.lock().await;
+        if run.running {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "уже идёт публикация" })),
+            )
+                .into_response();
+        }
+        *run = RunInfo {
+            running: true,
+            started_at: Some(chrono::Local::now().format("%H:%M:%S").to_string()),
+            randomize: false,
+            ..Default::default()
+        };
+        run.push(format!("старт шортсы: канал={:?}", req.channel));
+    }
+
+    let ctx = s.ctx.clone();
+    let state2 = s.clone();
+    tokio::spawn(async move {
+        let r = crate::shorts::publish(&ctx, req.channel.as_deref(), false).await;
+        let mut run = state2.run.lock().await;
+        run.running = false;
+        match r {
+            Ok(()) => run.push(String::from("шортсы готово")),
+            Err(e) => run.push(format!("ошибка: {e:#}")),
+        }
+        run.current = None;
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({ "started": true }))).into_response()
+}
+
 async fn api_get_settings(State(s): State<AppState>) -> impl IntoResponse {
     Json(serde_json::to_value(&s.ctx.settings).unwrap_or_default()).into_response()
 }
@@ -274,6 +340,8 @@ pub fn router_for(ctx: &Context) -> Router {
         .route("/", get(index))
         .route("/api/state", get(api_state))
         .route("/api/publish", post(api_publish))
+        .route("/api/shorts", get(api_shorts))
+        .route("/api/shorts/publish", post(api_shorts_publish))
         .route("/api/settings", get(api_get_settings).put(api_put_settings))
         .route("/api/history", get(api_history))
         .route("/api/tokens", get(api_tokens))

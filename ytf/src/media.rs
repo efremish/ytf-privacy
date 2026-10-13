@@ -145,17 +145,21 @@ impl Renderer {
         }
         a.push("-i".into()); a.push(music.to_string_lossy().into_owned());
 
-        // кадр: вписать с обрезкой или с чёрными полями
+        // кадр: заполнить с обрезкой (true) или квадрат по центру с чёрными
+        // полями (false): из источника ЛЮБОГО соотношения сторон вырезается
+        // центр-квадрат и вписывается по высоте (требование заказчика)
         let geom = if c.crop_to_fill {
             format!(
                 "scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h}",
                 w = c.width, h = c.height
             )
         } else {
+            let s = c.width.min(c.height);
             format!(
-                "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
+                "scale={s}:{s}:force_original_aspect_ratio=increase:flags=lanczos,\
+                 crop={s}:{s},\
                  pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
-                w = c.width, h = c.height
+                w = c.width, h = c.height, s = s
             )
         };
 

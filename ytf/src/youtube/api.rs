@@ -223,17 +223,19 @@ pub async fn fetch_thumb_bytes(url: &str) -> Result<Vec<u8>> {
 }
 
 /// Залить свою обложку: POST /upload/youtube/v3/thumbnails/set
+///
+/// videoId — ОБЯЗАТЕЛЬНЫЙ query-параметр (не поле формы!). Раньше он
+/// лежал в multipart-форме, Google его не видел и отвечал 404
+/// «video cannot be found» — из-за чего авто-обложка никогда не работала.
 pub async fn set_thumbnail(session: &Session, video_id: &str, jpeg: Vec<u8>) -> Result<()> {
     let part = reqwest::multipart::Part::bytes(jpeg)
         .file_name("thumb.jpg")
         .mime_str("image/jpeg")
         .context("mime")?;
-    let form = reqwest::multipart::Form::new()
-        .text("videoId", video_id.to_string())
-        .part("media", part);
+    let form = reqwest::multipart::Form::new().part("media", part);
 
     let client = super::auth::http_client()?;
-    let url = format!("{UPLOAD_BASE}/thumbnails/set");
+    let url = format!("{UPLOAD_BASE}/thumbnails/set?videoId={}", urlenc(video_id));
     let resp = client
         .post(&url)
         .bearer_auth(&session.token)

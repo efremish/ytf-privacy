@@ -33,3 +33,9 @@ site/
 ytf/pack/tools/
 ytf/pack/ytf-macos
 ytf/pack/ytf.exe
+
+# Logs
+logs/
+
+# Shorts media
+Shorts/

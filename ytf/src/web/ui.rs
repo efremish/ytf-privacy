@@ -62,6 +62,7 @@ a{color:var(--ac)}
 
 <nav>
   <button class="on" data-t="ch">Каналы</button>
+  <button data-t="sh">Шортсы</button>
   <button data-t="pub">Публикация</button>
   <button data-t="set">Настройки</button>
   <button data-t="his">Журнал</button>
@@ -80,6 +81,26 @@ a{color:var(--ac)}
       <th>Человек</th><th>Папка</th><th>Канал на YT</th><th>Режим</th>
       <th>Треки</th><th>Картинки</th><th>Видео</th><th>Использовано</th><th>Токен</th><th></th>
     </tr></thead><tbody id="chb"><tr><td colspan="10" class="muted">загрузка…</td></tr></tbody></table>
+  </div>
+</section>
+
+<section class="tab" id="t-sh">
+  <div class="card">
+    <div class="row"><h2 style="margin:0">Шортсы</h2><span class="sp"></span>
+      <button class="b g" onclick="loadSh()">Обновить</button>
+      <button class="b" id="shgo" onclick="shPublish('')">Залить все</button></div>
+    <p class="muted" style="margin-top:8px">
+      Готовые вертикальные видео складывай в папку
+      <span class="mono">Shorts/&lt;канал&gt;/</span> (.mp4). Залитые программа
+      перемещает в <span class="mono">_uploaded/</span>. Заголовок = имя файла.
+      Описание/теги — <span class="mono">_config.json</span> в папке канала.
+      Токены общие, из <span class="mono">tokens.json</span>.
+    </p>
+  </div>
+  <div class="card" style="padding:0;overflow:hidden">
+    <table><thead><tr>
+      <th>Папка</th><th>Видео в очереди</th><th>Файлы</th><th>Токен</th><th></th>
+    </tr></thead><tbody id="shb"><tr><td colspan="5" class="muted">загрузка…</td></tr></tbody></table>
   </div>
 </section>
 
@@ -203,6 +224,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   $('t-'+b.dataset.t).classList.add('on');
   if(b.dataset.t==='his')loadHis();
   if(b.dataset.t==='tok')loadTok();
+  if(b.dataset.t==='sh')loadSh();
 });
 
 let S=null;
@@ -219,6 +241,8 @@ async function load(){
   st.className = 'badge '+(R.running?'busy':'');
   $('pgo').disabled=!!R.running;
   $('pgo').textContent = R.running? 'идёт…' : 'Опубликовать';
+  $('shgo').disabled=!!R.running;
+  $('shgo').textContent = R.running? 'идёт…' : 'Залить все';
   if(R.log && R.log.length) $('log').textContent=R.log.join('\n');
   if(R.running) setTimeout(load,1500);
 
@@ -311,6 +335,36 @@ async function loadTok(){
     <td>${t.has_upload_scope?'<span class="pill y">есть</span>':'<span class="pill n">нет</span>'}</td>
     <td>${t.ok?'<span class="pill y">живой</span>':`<span class="pill n">${esc(t.error||'мёртв')}</span>`}</td>
   </tr>`).join('') || '<tr><td colspan=4 class=muted>токенов нет</td></tr>';
+}
+
+async function loadSh(){
+  $('shb').innerHTML='<tr><td colspan=5 class=muted>проверяю…</td></tr>';
+  try{
+    const r=await fetch('/api/shorts'); const j=await r.json();
+    $('shb').innerHTML=(j.channels||[]).map(c=>{
+      const tok=c.has_token?'<span class="pill y">ок</span>':'<span class="pill n">нет</span>';
+      const files=c.files.map(f=>'<span class="pill">'+esc(f)+'</span>').join(' ')||'<span class="muted">—</span>';
+      const btn=c.has_token&&c.count
+        ? `<button class="b g" onclick="shPublish('${esc(c.folder)}')">Залить</button>` : '';
+      return `<tr>
+        <td class="mono">${esc(c.folder)}</td>
+        <td>${c.count}</td>
+        <td>${files}</td>
+        <td>${tok}</td>
+        <td>${btn}</td></tr>`;
+    }).join('') || '<tr><td colspan=5 class=muted>папок Shorts/ нет — создай Shorts/&lt;канал&gt;/ и положи туда .mp4</td></tr>';
+  }catch(e){ $('shb').innerHTML='<tr><td colspan=5 class=err-t>'+esc(e)+'</td></tr>'; }
+}
+
+async function shPublish(folder){
+  if(!folder && !confirm('Залить ВСЕ видео из всех папок Shorts/?')) return;
+  $('shgo').disabled=true;
+  const r=await fetch('/api/shorts/publish',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({channel:folder||null})});
+  const j=await r.json();
+  if(j.error){ alert(j.error); $('shgo').disabled=false; return; }
+  load(); loadSh();
+  document.querySelector('nav button[data-t="pub"]').click();
 }
 
 load();

@@ -78,6 +78,12 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
     println!("         в Nstbrowser (где залогинен нужный YouTube-аккаунт)");
     println!("         и открой. Подойдёт и обычный браузер с этим аккаунтом.");
     println!();
+    println!("  ШАГ 2b. ВАЖНО для почты с НЕСКОЛЬКИМИ каналами: после входа");
+    println!("         Google покажет список каналов/аккаунтов (brand accounts).");
+    println!("         Выбери ИМЕННО нужный канал! Можно заранее переключиться");
+    println!("         на него через аватар на youtube.com — тогда Google сразу");
+    println!("         выдаст токен для него и список не покажет.");
+    println!();
     println!("  ШАГ 3. Нажми «Продолжить» / «Allow».");
     println!("         Если Google предупреждает «приложение не проверено»:");
     println!("         «Дополнительные настройки» → «Перейти на страницу (небезопасно)»");
@@ -89,6 +95,8 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
     println!();
     println!("  ШАГ 5. Скопируй ВЕСЬ адрес из строки браузера и вставь сюда.");
     println!("  ────────────────────────────────────────────────────────────────\n");
+
+    tracing::info!("auth[{folder}]: ссылка выдана, клиент {project}");
 
     copy_to_clipboard(&url);
     println!("  (ссылка скопирована в буфер обмена — просто Ctrl+V / Cmd+V)\n");
@@ -103,10 +111,16 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
     if pasted.is_empty() {
         bail!("пустая строка — запускай заново");
     }
+    // Google мог отказать (access_denied, error_description) — покажем
+    // причину как она есть, а не «не нашлось ?code=...»
+    if let Some(e) = capture_error(&pasted) {
+        bail!("Google отказал в доступе: {e}");
+    }
     let code = extract_code(pasted)
         .ok_or_else(|| anyhow::anyhow!("в вставленном тексте не нашлось ?code=... — убедись, \
                  что копируешь адрес ПОСЛЕ нажатия «Продолжить»"))?;
 
+    tracing::info!("auth[{folder}]: код получен, меняю на токен");
     println!("\n  ✓ Код принят, меняю на токен...");
 
     let client = super::auth::http_client()?;
@@ -124,12 +138,15 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        tracing::error!("auth[{folder}]: Google отказал на token endpoint ({status}): {text}");
         bail!("Google отказал: {text}");
     }
 
     let tr: TokenResp = serde_json::from_str(&text)?;
     if let Some(e) = tr.error {
-        bail!("{e}: {}", tr.error_description.unwrap_or_default());
+        let d = tr.error_description.unwrap_or_default();
+        tracing::error!("auth[{folder}]: {e}: {d}");
+        bail!("{e}: {d}");
     }
     let refresh = tr
         .refresh_token
@@ -137,7 +154,19 @@ pub async fn run(ctx: &Context, folder: &str, title: Option<&str>) -> Result<()>
                  https://myaccount.google.com/permissions")?;
 
     let granted = tr.scope.unwrap_or_else(|| scopes.join(" "));
+    tracing::info!("auth[{folder}]: токен получен, scopes: {granted}");
     println!("  Выдано scopes: {granted}");
+
+    // Экран согласия Google-2026: без отмеченных чекбоксов Continue
+    // выдаёт токен БЕЗ прав — ловим сразу, а не при первой публикации
+    if !granted.split(' ').any(|s| s.ends_with("/youtube.upload")) {
+        println!("\n  [!] ВНИМАНИЕ: право загрузки (youtube.upload) НЕ выдано!");
+        println!("      Скорее всего на экране согласия Google не были");
+        println!("      отмечены галочки разрешений («Select all»).");
+        println!("      Отзови доступ (myaccount.google.com/permissions)");
+        println!("      и повтори ytf auth, отметив галочки перед Continue.");
+        tracing::warn!("auth[{folder}]: нет scope youtube.upload — на экране согласия не отмечены галочки");
+    }
 
     let mut store = TokenStore::load(ctx).unwrap_or_default();
     store.channels.insert(
