@@ -211,6 +211,8 @@ async fn api_publish(
 struct ShortsReq {
     #[serde(default)]
     channel: Option<String>,
+    #[serde(default)]
+    all: bool,
 }
 
 /// Список папок Shorts/ и что в них лежит
@@ -226,6 +228,8 @@ async fn api_shorts(State(s): State<AppState>) -> impl IntoResponse {
                 "has_token": c.has_token,
                 "description": c.cfg.description,
                 "tags": c.cfg.tags.len(),
+                "per_run": c.cfg.per_run.unwrap_or(1),
+                "schedule": c.cfg.schedule.unwrap_or(true),
             })
         })
         .collect();
@@ -251,13 +255,14 @@ async fn api_shorts_publish(
             randomize: false,
             ..Default::default()
         };
-        run.push(format!("старт шортсы: канал={:?}", req.channel));
+        run.push(format!("старт шортсы: канал={:?} всё={}", req.channel, req.all));
     }
 
     let ctx = s.ctx.clone();
     let state2 = s.clone();
+    let all = req.all;
     tokio::spawn(async move {
-        let r = crate::shorts::publish(&ctx, req.channel.as_deref(), false).await;
+        let r = crate::shorts::publish(&ctx, req.channel.as_deref(), false, all).await;
         let mut run = state2.run.lock().await;
         run.running = false;
         match r {

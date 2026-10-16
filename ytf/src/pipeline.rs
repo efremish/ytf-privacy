@@ -173,7 +173,7 @@ async fn run_one(
         let s = tm.session().await?;
         let info = auth::channel_info(&s).await?;
         channel_title = info.title;
-        occupied = schedule::occupied(&s, &info.uploads_playlist).await?;
+        occupied = schedule::occupied_slots(&s, &info.uploads_playlist).await?;
         session = Some(s);
     }
 
@@ -186,14 +186,14 @@ async fn run_one(
         }
     }
 
-    // ── 3. занятые даты ──
+    // ── 3. занятые слоты (дата+время) ──
     let now = chrono::Utc::now();
-    let day = schedule::next_free_day(&occupied, now, horizon);
     let (hour, minute) = match &ch.config.publish_at {
         Some(s) => schedule::parse_hhmm(s),
         None => (ctx.settings.publish.hour, ctx.settings.publish.minute),
     };
     let offset = schedule::tz_offset(ctx, None);
+    let day = schedule::next_free_slot(&occupied, now, horizon, hour, minute, offset);
     let publish_at = schedule::publish_at(day, hour, minute, offset);
     let published_local = schedule::publish_at(day, hour, minute, 0);
 

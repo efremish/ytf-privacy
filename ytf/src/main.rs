@@ -74,13 +74,17 @@ enum Cmd {
         #[arg(long)]
         no_upload: bool,
     },
-    /// Залить готовые шортсы из Shorts/<канал>/ (без рендера)
+    /// Залить готовые шортсы из Shorts/<канал>/ (без рендера).
+    /// По умолчанию: 1 видео на канал за запуск, с отложкой на свободный день.
     Shorts {
         /// канал (имя папки в Shorts/). Без флага — все
         channel: Option<String>,
         /// показать план, но ничего не загружать
         #[arg(long)]
         no_upload: bool,
+        /// взять ВСЮ очередь, а не по одному на канал (как было раньше)
+        #[arg(long)]
+        all: bool,
     },
     /// Проверить, считает ли система кадр чёрным (диагностика обложки)
     CheckThumb {
@@ -127,8 +131,8 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Cmd::Auth { folder, title } => youtube::oauth::run(&ctx, &folder, title.as_deref()).await,
-            Cmd::Shorts { channel, no_upload } => {
-                shorts::publish(&ctx, channel.as_deref(), no_upload).await
+            Cmd::Shorts { channel, no_upload, all } => {
+                shorts::publish(&ctx, channel.as_deref(), no_upload, all).await
             }
             Cmd::CheckThumb { file } => pipeline::check_thumb(&ctx, &file).await,
             Cmd::SetThumb { video_id, file } => pipeline::set_thumb(&ctx, &video_id, &file).await,

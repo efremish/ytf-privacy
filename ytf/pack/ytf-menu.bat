@@ -112,12 +112,29 @@ goto menu
 :shorts
 cls
 echo Shortsy: kladi gotovye .mp4 v papku Shorts (imya papki) i zhalis "8".
+echo Po umolchaniyu beret 1 video na kanal i stavit otlozhku.
+echo.
+set /p mode="1 - po 1 na kanal (s otlozhkoy), 2 - vsya ochered, 3 - tolko proverka: "
 echo.
 set /p folder="Imya papki kanala (ili Enter dlya vseh): "
-if "%folder%"=="" (
-  .\ytf.exe shorts
+if "%mode%"=="3" (
+  if "%folder%"=="" (
+    .\ytf.exe shorts --no-upload
+  ) else (
+    .\ytf.exe shorts "%folder%" --no-upload
+  )
+) else if "%mode%"=="2" (
+  if "%folder%"=="" (
+    .\ytf.exe shorts --all
+  ) else (
+    .\ytf.exe shorts "%folder%" --all
+  )
 ) else (
-  .\ytf.exe shorts "%folder%"
+  if "%folder%"=="" (
+    .\ytf.exe shorts
+  ) else (
+    .\ytf.exe shorts "%folder%"
+  )
 )
 echo.
 pause

@@ -5,23 +5,88 @@ use super::api;
 use super::auth::Session;
 use crate::settings::Context;
 
-/// Даты, уже занятые на канале — и отложенные, и опубликованные
-pub async fn occupied(session: &Session, uploads_playlist: &str) -> Result<Vec<String>> {
+/// Занятые СЛОТЫ: дата+время (UTC, «YYYY-MM-DDTHH:MM»).
+///
+/// Раньше хранили только дату — из-за этого видео и шортс не могли выйти
+/// в один день даже в разное время. Теперь сравниваем дату+время.
+pub async fn occupied_slots(session: &Session, uploads_playlist: &str) -> Result<Vec<String>> {
     let vids = api::channel_videos(session, uploads_playlist, 300).await?;
-    let mut dates: Vec<String> = vids
-        .iter()
-        .filter_map(|v| {
-            let s = v.publish_at.trim();
-            if s.len() >= 10 && s[..4].chars().all(|c| c.is_ascii_digit()) {
-                Some(s[..10].to_string())
-            } else {
-                None
+    let mut slots: Vec<String> = vids.iter().filter_map(|v| slot_key(&v.publish_at)).collect();
+    slots.sort();
+    slots.dedup();
+    Ok(slots)
+}
+
+/// «2026-10-17T16:00:00Z» -> «2026-10-17T16:00». None, если формат не тот.
+pub fn slot_key(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.len() >= 16 && s.as_bytes().get(10) == Some(&b'T') {
+        Some(s[..16].to_string())
+    } else {
+        None
+    }
+}
+
+/// «HH:MM» -> минуты от полуночи
+fn hm(s: &str) -> Option<i64> {
+    let h: i64 = s.get(0..2)?.parse().ok()?;
+    let m: i64 = s.get(3..5)?.parse().ok()?;
+    Some(h * 60 + m)
+}
+
+/// Насколько близко по времени считаем слот «тем же» (минуты). Небольшой
+/// запас, чтобы расхождение на пару минут не привело к двойной публикации.
+const SLOT_TOLERANCE_MIN: i64 = 30;
+
+/// Свободен ли день `day` для публикации в `hour:minute` (в зоне `offset`).
+/// Конфликт — только если в этот же день уже есть публикация рядом по времени.
+pub fn slot_free(
+    occupied: &[String],
+    day: NaiveDate,
+    hour: u32,
+    minute: u32,
+    offset_hours: i64,
+) -> bool {
+    let target = publish_at(day, hour, minute, offset_hours);
+    let Some(tkey) = slot_key(&target) else { return true };
+    let tdate = &tkey[..10];
+    let tmin = hm(&tkey[11..16]).unwrap_or(0);
+    for o in occupied {
+        if o.len() < 16 || &o[..10] != tdate {
+            continue;
+        }
+        if let Some(omin) = hm(&o[11..16]) {
+            if (omin - tmin).abs() <= SLOT_TOLERANCE_MIN {
+                return false;
             }
-        })
-        .collect();
-    dates.sort();
-    dates.dedup();
-    Ok(dates)
+        }
+    }
+    true
+}
+
+/// Ближайший день, где слот `hour:minute` свободен.
+///
+/// Логика Матвея: «есть видео на сегодня? если нет — на сегодня, если есть —
+/// на завтра». Теперь то же, но с учётом времени: публикация в другое время
+/// того же дня не мешает.
+pub fn next_free_slot(
+    occupied: &[String],
+    from: DateTime<Utc>,
+    horizon_days: i64,
+    hour: u32,
+    minute: u32,
+    offset_hours: i64,
+) -> NaiveDate {
+    let today: NaiveDate = from.date_naive();
+    let max_look = horizon_days.max(1);
+
+    for i in 0..=max_look {
+        let d = today + Duration::days(i);
+        if slot_free(occupied, d, hour, minute, offset_hours) {
+            return d;
+        }
+    }
+    today + Duration::days(max_look)
 }
 
 /// Разобрать "HH:MM" в часы/минуты
@@ -30,25 +95,6 @@ pub fn parse_hhmm(s: &str) -> (u32, u32) {
     let h = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(22);
     let m = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
     (h.clamp(0, 23), m.clamp(0, 59))
-}
-
-/// Ближайший свободный день начиная с `from`.
-///
-/// Логика как просил Матвей: «смотрит, есть ли видео на сегодня. Если нет —
-/// выкладывает на сегодня, если есть — на завтра». Плюс `horizon` дней вперёд.
-pub fn next_free_day(occupied: &[String], from: DateTime<Utc>, horizon_days: i64) -> NaiveDate {
-    let today: NaiveDate = from.date_naive();
-    let max_look = horizon_days.max(1);
-
-    for i in 0..=(max_look as i64) {
-        let d = today + Duration::days(i);
-        let key = d.format("%Y-%m-%d").to_string();
-        if !occupied.iter().any(|o| o == &key) {
-            return d;
-        }
-    }
-    // горизонт кончился — всё занято, берём следующий день после него
-    today + Duration::days(max_look)
 }
 
 /// Собрать `publishAt` в формате, который ждёт YouTube (UTC, RFC3339)
@@ -97,35 +143,53 @@ fn offset_from_tz(tz: &str) -> i64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn сегодня_свободен() {
-        let now = Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap();
-        let d = next_free_day(&["2026-09-28".into()], now, 1);
-        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 9, 26).unwrap());
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
     #[test]
-    fn сегодня_занят_берём_завтра() {
-        let now = Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap();
-        let d = next_free_day(&["2026-09-26".into()], now, 3);
-        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 9, 27).unwrap());
+    fn слот_ключ_из_rfc3339() {
+        assert_eq!(slot_key("2026-10-17T16:00:00Z"), Some("2026-10-17T16:00".into()));
+        assert_eq!(slot_key("2026-10-17"), None);
     }
 
     #[test]
-    fn три_дня_подряд_заняты() {
-        let now = Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap();
+    fn свободный_день_берём_сегодня() {
+        // занято 28-е в 16:00 UTC, сегодня 26-е — берём 26-е
+        let occ = vec!["2026-09-28T16:00".to_string()];
+        let d = next_free_slot(&occ, Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap(), 1, 22, 0, 6);
+        assert_eq!(d, day(2026, 9, 26));
+    }
+
+    #[test]
+    fn то_же_время_занято_берём_завтра() {
+        // 26-е 16:00 UTC занято, публикация тоже 22:00 Омск (=16:00 UTC)
+        let occ = vec!["2026-09-26T16:00".to_string()];
+        let d = next_free_slot(&occ, Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap(), 3, 22, 0, 6);
+        assert_eq!(d, day(2026, 9, 27));
+    }
+
+    #[test]
+    fn разное_время_в_один_день_можно() {
+        // 26-е 16:00 UTC (22:00 Омск) занято, шортс хотим в 12:00 Омск (=06:00 UTC)
+        let occ = vec!["2026-09-26T16:00".to_string()];
+        let d = next_free_slot(&occ, Utc.with_ymd_and_hms(2026, 9, 26, 4, 0, 0).unwrap(), 3, 12, 0, 6);
+        assert_eq!(d, day(2026, 9, 26), "разное время — день свободен");
+    }
+
+    #[test]
+    fn три_дня_подряд_заняты_в_то_же_время() {
         let occ = vec![
-            "2026-09-26".to_string(),
-            "2026-09-27".to_string(),
-            "2026-09-28".to_string(),
+            "2026-09-26T16:00".to_string(),
+            "2026-09-27T16:00".to_string(),
+            "2026-09-28T16:00".to_string(),
         ];
-        let d = next_free_day(&occ, now, 7);
-        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
+        let d = next_free_slot(&occ, Utc.with_ymd_and_hms(2026, 9, 26, 10, 0, 0).unwrap(), 7, 22, 0, 6);
+        assert_eq!(d, day(2026, 9, 29));
     }
 
     #[test]
     fn омск_22_00_это_16_00_utc() {
-        let day = NaiveDate::from_ymd_opt(2026, 9, 26).unwrap();
-        assert_eq!(publish_at(day, 22, 0, 6), "2026-09-26T16:00:00Z");
+        assert_eq!(publish_at(day(2026, 9, 26), 22, 0, 6), "2026-09-26T16:00:00Z");
     }
 }
