@@ -1,31 +1,34 @@
-//! Шортсы: заливка готовых вертикальных видео из `Shorts/<канал>/`.
+//! Шортсы: заливка готовых вертикальных видео.
 //!
 //! Рендера нет — видео уже сделаны снаружи (генератор, редактор).
 //!
-//! Структура:
-//!   Shorts/
-//!   └── <канал>/
-//!       ├── _config.json   необязательно: описание, теги, режим
-//!       ├── video1.mp4     ← сюда складывать готовые шортсы
-//!       └── _uploaded/     сюда программа перемещает залитое
+//! Два способа складывать:
 //!
-//! Токены — общие, из `tokens.json` (ключ = имя папки канала).
-//! Заголовок — имя файла без расширения.
+//! 1. **Общий пул** — `Shorts/_pool/` (или просто файлы в `Shorts/`).
+//!    На каждый запуск программа берёт по одному СЛУЧАЙНОМУ видео
+//!    на каждый подключённый канал и заливает сразу. Так 100 роликов
+//!    в одной папке распределяются по 10 каналам, а не уходят все
+//!    на один.
 //!
-//! По умолчанию за один запуск берётся ОДНО видео на канал и ставится
-//! отложенная публикация на ближайший свободный день (как основной
-//! пайплайн). Так 100 видео не вываливаются разом на один канал, а
-//! раскладываются по дням. Ключ `per_run` в `_config.json` меняет
-//! количество, `schedule: false` отключает отложку (заливка сразу).
+//! 2. **Папка канала** — `Shorts/<канал>/`. Берётся одно видео
+//!    (или `per_run`) и уходит на этот канал.
+//!
+//! По умолчанию шортсы публикуются СРАЗУ (public). Отложка не нужна —
+//! это решение заказчика. Если всё же надо по слотам — `schedule: true`
+//! и `publish_at` в `_config.json`.
+//!
+//! Залитое перемещается в `_uploaded/` рядом с исходником.
 
 use anyhow::Context as _;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use rand::seq::SliceRandom;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::report::{History, HistoryEntry};
 use crate::settings::Context;
-use crate::tokens::{ChannelToken, TokenStore};
+use crate::tokens::TokenStore;
 use crate::youtube::auth::{self, TokenManager};
 use crate::youtube::{api, schedule, upload};
 
@@ -33,7 +36,7 @@ const VIDEO_EXT: [&str; 6] = ["mp4", "mov", "webm", "mkv", "m4v", "avi"];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShortsConfig {
-    /// Описание видео (одно на папку). None = пусто
+    /// Описание видео (одно на папку/пул). None = пусто
     #[serde(default)]
     pub description: Option<String>,
     /// Теги
@@ -42,18 +45,18 @@ pub struct ShortsConfig {
     /// Категория YouTube, по умолчанию 22 (People & Blogs)
     #[serde(default)]
     pub category_id: Option<String>,
-    /// "public" | "private" | "unlisted" (когда отложка выключена)
+    /// "public" | "private" | "unlisted". По умолчанию public
     #[serde(default)]
     pub privacy: Option<String>,
     #[serde(default)]
     pub made_for_kids: bool,
-    /// Сколько видео брать из очереди канала за один запуск. None = 1
+    /// Сколько видео брать на канал за один запуск. None = 1
     #[serde(default)]
     pub per_run: Option<usize>,
-    /// Ставить отложенную публикацию (private + publishAt). None = true
+    /// Ставить отложенную публикацию. None = false (сразу)
     #[serde(default)]
     pub schedule: Option<bool>,
-    /// Время публикации "HH:MM". None = из settings.json (22:00)
+    /// Время публикации "HH:MM" (только если schedule = true)
     #[serde(default)]
     pub publish_at: Option<String>,
 }
@@ -67,38 +70,101 @@ pub struct ShortsChannel {
     pub has_token: bool,
 }
 
-/// Найти все каналы шортсов и что в них лежит
-pub fn scan(ctx: &Context) -> Vec<ShortsChannel> {
+/// Что нашлось на диске
+#[derive(Debug)]
+pub struct Plan {
+    /// Папки каналов `Shorts/<канал>/`
+    pub channels: Vec<ShortsChannel>,
+    /// Общий пул: `Shorts/_pool/*.mp4` + файлы прямо в `Shorts/`
+    pub pool: Vec<PathBuf>,
+    pub pool_dir: PathBuf,
+    pub pool_cfg: ShortsConfig,
+    /// Каналы, между которыми распределяется пул
+    pub targets: Vec<String>,
+}
+
+/// Найти всё, что лежит в Shorts/
+pub fn scan(ctx: &Context) -> Plan {
     let root = ctx.root.join("Shorts");
     let store = TokenStore::load(ctx).unwrap_or_default();
-    let Ok(rd) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
+    let pool_dir = root.join("_pool");
+    let pool_cfg = load_cfg(&pool_dir);
 
-    let mut out: Vec<ShortsChannel> = Vec::new();
-    let mut dirs: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.sort();
+    let mut channels: Vec<ShortsChannel> = Vec::new();
+    let mut pool: Vec<PathBuf> = Vec::new();
 
-    for dir in dirs {
-        let folder = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        if folder.starts_with('_') || folder.starts_with('.') {
-            continue;
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        let mut dirs: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+
+        for dir in dirs {
+            let folder = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if folder.starts_with('_') || folder.starts_with('.') {
+                continue;
+            }
+            let cfg = load_cfg(&dir);
+            let pending = list_videos(&dir);
+            channels.push(ShortsChannel {
+                has_token: store.get(&folder).is_some(),
+                folder,
+                dir,
+                pending,
+                cfg,
+            });
         }
-        let cfg = load_cfg(&dir);
-        let pending = list_videos(&dir);
-        out.push(ShortsChannel {
-            has_token: store.get(&folder).is_some(),
-            folder,
-            dir,
-            pending,
-            cfg,
-        });
     }
-    out
+
+    // общий пул: файлы прямо в Shorts/ + содержимое _pool/
+    pool.extend(list_videos(&root));
+    pool.extend(list_videos(&pool_dir));
+
+    Plan {
+        channels,
+        pool,
+        pool_dir,
+        pool_cfg,
+        targets: load_targets(ctx, &store),
+    }
+}
+
+/// Кому распределять общий пул.
+///
+/// 1) `Shorts/_targets.json` — явный список каналов (если файл есть);
+/// 2) иначе — ВСЕ подключённые каналы из tokens.json.
+///
+/// Специально не фильтруем по папкам в People/: пул — это маркетинговые
+/// ролики, для них папка канала в People/ не нужна.
+fn load_targets(ctx: &Context, store: &TokenStore) -> Vec<String> {
+    let all: Vec<String> = store.channels.keys().cloned().collect();
+
+    #[derive(Deserialize)]
+    struct Targets {
+        channels: Vec<String>,
+    }
+    let tf = ctx.root.join("Shorts").join("_targets.json");
+    if let Ok(s) = std::fs::read_to_string(&tf) {
+        let s = s.trim_start_matches('\u{feff}');
+        match serde_json::from_str::<Targets>(s) {
+            Ok(t) => {
+                let v: Vec<String> = t
+                    .channels
+                    .into_iter()
+                    .filter(|c| store.channels.contains_key(c))
+                    .collect();
+                if !v.is_empty() {
+                    return v;
+                }
+                tracing::warn!("shorts: _targets.json не дал ни одного известного канала — беру все");
+            }
+            Err(_) => tracing::warn!("shorts: _targets.json не распарсился — беру все каналы"),
+        }
+    }
+
+    all
 }
 
 fn load_cfg(dir: &Path) -> ShortsConfig {
@@ -110,7 +176,7 @@ fn load_cfg(dir: &Path) -> ShortsConfig {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
-                        "shorts[{}]: _config.json не распарсился ({e}) — использую значения по умолчанию",
+                        "shorts[{}]: _config.json не распарсился ({e}) — значения по умолчанию",
                         dir.display()
                     );
                     ShortsConfig::default()
@@ -136,7 +202,6 @@ fn list_videos(dir: &Path) -> Vec<PathBuf> {
                     .unwrap_or(false)
         })
         .collect();
-    // по имени — стабильный порядок
     v.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     v
 }
@@ -148,8 +213,7 @@ fn title_of(path: &Path) -> String {
         .into_owned()
 }
 
-/// Ширина/высота через ffprobe — для диагностики «это вообще шортс?».
-/// None = не прочиталось (не критично).
+/// Ширина/высота через ffprobe — для диагностики «это вообще шортс?»
 fn probe_wh(ctx: &Context, path: &Path) -> Option<(u64, u64)> {
     let out = std::process::Command::new(&ctx.ffprobe)
         .args(["-v", "error", "-select_streams", "v:0"])
@@ -164,10 +228,8 @@ fn probe_wh(ctx: &Context, path: &Path) -> Option<(u64, u64)> {
     Some((w, h))
 }
 
-/// Следующие `count` свободных дат начиная с сегодня. Занятые слоты
-/// учитываем по дате+времени: если в этот день уже есть публикация в
-/// другое время — день свободен. Выбранные слоты добавляем в `occupied`,
-/// чтобы в одном запуске не выдать две публикации на одно время.
+/// Следующие `count` свободных дат. Учитываем дату+время: публикация
+/// в другой час того же дня не мешает.
 fn free_days(
     occupied: &mut Vec<String>,
     from: DateTime<Utc>,
@@ -194,22 +256,17 @@ fn free_days(
     out
 }
 
-/// Залить шортсы из папок. `only` — конкретный канал, None = все.
-/// `no_upload` — только показать план. `all` — брать всю очередь
-/// (иначе `per_run`, по умолчанию 1 видео на канал за запуск).
+/// Главная точка: обработать папки каналов и общий пул.
 pub async fn publish(
     ctx: &Context,
     only: Option<&str>,
     no_upload: bool,
     all: bool,
 ) -> anyhow::Result<()> {
-    let mut chans = scan(ctx);
-    if let Some(o) = only {
-        chans.retain(|c| c.folder.eq_ignore_ascii_case(o));
-    }
-    if chans.is_empty() {
+    let plan = scan(ctx);
+    if plan.channels.is_empty() && plan.pool.is_empty() {
         println!("Папок Shorts/ нет или они пусты.");
-        println!("Создай Shorts/<канал>/ и положи туда .mp4");
+        println!("Положи .mp4 в Shorts/_pool/ (общий пул) или в Shorts/<канал>/");
         return Ok(());
     }
 
@@ -218,13 +275,19 @@ pub async fn publish(
     let mut quota = crate::youtube::quota::QuotaState::load(&ctx.state_file());
     let now = Utc::now();
     let offset = schedule::tz_offset(ctx, None);
+    let mut sessions: HashMap<String, auth::Session> = HashMap::new();
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
 
-    for ch in &chans {
+    // ── 1. папки конкретных каналов ──
+    for ch in &plan.channels {
+        if let Some(o) = only {
+            if !ch.folder.eq_ignore_ascii_case(o) {
+                continue;
+            }
+        }
         if ch.pending.is_empty() {
-            println!("{} — очередь пуста", ch.folder);
             continue;
         }
         let take = if all {
@@ -232,136 +295,147 @@ pub async fn publish(
         } else {
             ch.cfg.per_run.unwrap_or(1).max(1).min(ch.pending.len())
         };
-        let schedule_on = ch.cfg.schedule.unwrap_or(true);
+        let schedule_on = ch.cfg.schedule.unwrap_or(false);
         println!(
-            "{} — в очереди {}, беру {}, отложка: {}, токен: {}",
+            "{} — в папке {}, беру {}, {}",
             ch.folder,
             ch.pending.len(),
             take,
-            if schedule_on { "да" } else { "нет (сразу)" },
-            if ch.has_token { "есть" } else { "НЕТ" }
+            if schedule_on { "с отложкой" } else { "сразу" }
         );
 
-        let (hour, minute) = match &ch.cfg.publish_at {
-            Some(s) => schedule::parse_hhmm(s),
-            None => (ctx.settings.publish.hour, ctx.settings.publish.minute),
-        };
-
-        // в режиме проверки показываем план и без токена
         if no_upload {
-            for (k, f) in ch.pending.iter().take(take).enumerate() {
-                let mb = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0) / 1_048_576;
-                if schedule_on {
-                    let d = now.date_naive() + Duration::days(k as i64);
-                    println!(
-                        "  [проверка] {} ({} МБ) → слот {d} {:02}:{:02}",
-                        title_of(f), mb, hour, minute
-                    );
-                } else {
-                    println!("  [проверка] {} ({} МБ) → сразу", title_of(f), mb);
-                }
-            }
+            print_plan(&ch.folder, &ch.pending, take, &ch.cfg, now, offset);
             continue;
         }
-
-        let Some(tok) = store.get(&ch.folder) else {
+        let Some(_) = store.get(&ch.folder) else {
             tracing::error!("shorts[{}]: нет токена в tokens.json", ch.folder);
             println!("  [!] нет токена — запусти: ytf auth \"{}\"", ch.folder);
             failed += take;
             continue;
         };
 
-        // одна сессия на канал
-        let mut tm = TokenManager::new(tok);
-        let session = match tm.session().await {
+        let session = match session_for(&ch.folder, &store, &mut sessions).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("shorts[{}]: сессия не получена: {e:#}", ch.folder);
                 println!("  [FAIL] токен: {e:#}");
                 failed += take;
                 continue;
             }
         };
 
-        // занятые слоты на канале (и обычные видео, и уже отложенные шортсы)
-        let mut occupied: Vec<String> = Vec::new();
-        if schedule_on {
-            match auth::channel_info(&session).await {
-                Ok(info) => match schedule::occupied_slots(&session, &info.uploads_playlist).await {
-                    Ok(occ) => occupied = occ,
-                    Err(e) => tracing::warn!("shorts[{}]: не прочитал занятые слоты: {e}", ch.folder),
-                },
-                Err(e) => tracing::warn!("shorts[{}]: не получил info канала: {e}", ch.folder),
-            }
-        }
-        let days = free_days(&mut occupied, now, take, ctx.settings.publish.horizon_days, hour, minute, offset);
+        let (hour, minute) = hm_of(&ch.cfg, ctx);
+        let mut occupied = if schedule_on {
+            occupied_slots(&session, &ch.folder).await
+        } else {
+            Vec::new()
+        };
+        let days = if schedule_on {
+            free_days(&mut occupied, now, take, ctx.settings.publish.horizon_days, hour, minute, offset)
+        } else {
+            Vec::new()
+        };
 
         for (idx, file) in ch.pending.iter().take(take).enumerate() {
-            let (publish_at, when) = if schedule_on {
-                match days.get(idx) {
-                    Some(d) => (
-                        Some(schedule::publish_at(*d, hour, minute, offset)),
-                        schedule::publish_at(*d, hour, minute, 0),
-                    ),
-                    None => (None, "сразу".to_string()),
-                }
-            } else {
-                (None, "сразу".to_string())
-            };
-
-            match upload_one(ctx, ch, &session, file, publish_at, schedule_on, &mut quota).await {
+            let (publish_at, when) = slot_for(schedule_on, &days, idx, hour, minute, offset);
+            match upload_one(ctx, &ch.folder, &ch.cfg, &session, file, publish_at, schedule_on, &mut quota).await {
                 Ok(id) => {
                     uploaded += 1;
                     move_uploaded(file);
-                    let url = format!("https://youtube.com/watch?v={id}");
-                    println!("  ✓ {} → {url}  ({when})", title_of(file));
-                    tracing::info!("shorts[{}]: {} залит ({id}), слот {when}", ch.folder, title_of(file));
-                    history.push(HistoryEntry {
-                        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                        person: "shorts".into(),
-                        channel: ch.folder.clone(),
-                        video_id: id.clone(),
-                        url,
-                        title: title_of(file),
-                        track: file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                        picture: String::new(),
-                        publish_at: when,
-                        mode: "Shorts".into(),
-                        size_mb: std::fs::metadata(file)
-                            .map(|m| m.len() as f64 / 1_048_576.0)
-                            .unwrap_or(0.0),
-                        render_secs: 0.0,
-                        upload_secs: 0.0,
-                        thumbnail_fixed: false,
-                        error: None,
-                    });
+                    record_ok(&mut history, ctx, &ch.folder, file, &id, &when);
+                    println!("  ✓ {} → https://youtube.com/watch?v={id}  ({when})", title_of(file));
                 }
                 Err(e) => {
                     failed += 1;
-                    tracing::error!("shorts[{}]: {} — {e:#}", ch.folder, title_of(file));
+                    record_err(&mut history, ctx, &ch.folder, file, &when, &e);
                     println!("  ✗ {} — {e:#}", title_of(file));
-                    history.push(HistoryEntry {
-                        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                        person: "shorts".into(),
-                        channel: ch.folder.clone(),
-                        video_id: String::new(),
-                        url: String::new(),
-                        title: title_of(file),
-                        track: file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                        picture: String::new(),
-                        publish_at: when,
-                        mode: "Shorts".into(),
-                        size_mb: 0.0,
-                        render_secs: 0.0,
-                        upload_secs: 0.0,
-                        thumbnail_fixed: false,
-                        error: Some(format!("{e:#}")),
-                    });
                 }
             }
             let _ = history.save(&ctx.history_file());
         }
         let _ = quota.save(&ctx.state_file());
+    }
+
+    // ── 2. общий пул → распределить по каналам ──
+    if !plan.pool.is_empty() {
+        let targets: Vec<String> = match only {
+            Some(o) => vec![o.to_string()],
+            None => plan.targets.clone(),
+        };
+        let targets: Vec<String> = targets
+            .into_iter()
+            .filter(|t| store.channels.contains_key(t))
+            .collect();
+
+        if targets.is_empty() {
+            println!("\nПул: {} видео, но нет каналов с токенами для распределения.", plan.pool.len());
+        } else {
+            let per = plan.pool_cfg.per_run.unwrap_or(1).max(1);
+            let need = if all { plan.pool.len() } else { targets.len() * per };
+            let mut queue = plan.pool.clone();
+            queue.shuffle(&mut rand::thread_rng());
+            queue.truncate(need.min(queue.len()));
+
+            println!(
+                "\nПул: {} видео, каналов {}, беру {} (по {} на канал), {}",
+                plan.pool.len(),
+                targets.len(),
+                queue.len(),
+                per,
+                if plan.pool_cfg.schedule.unwrap_or(false) { "с отложкой" } else { "сразу" }
+            );
+
+            if no_upload {
+                print_plan("_pool", &queue, queue.len(), &plan.pool_cfg, now, offset);
+                println!("  каналы: {}", targets.join(", "));
+            } else {
+                for (i, file) in queue.iter().enumerate() {
+                    let target = &targets[i % targets.len()];
+                    let session = match session_for(target, &store, &mut sessions).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("  ✗ {target}: токен — {e:#}");
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    let schedule_on = plan.pool_cfg.schedule.unwrap_or(false);
+                    let (hour, minute) = hm_of(&plan.pool_cfg, ctx);
+                    // при отложке берём реально свободный день на этом канале
+                    let (publish_at, when) = if schedule_on {
+                        let mut occ = occupied_slots(&session, target).await;
+                        let days = free_days(
+                            &mut occ, now, 1, ctx.settings.publish.horizon_days, hour, minute, offset,
+                        );
+                        match days.first() {
+                            Some(d) => (
+                                Some(schedule::publish_at(*d, hour, minute, offset)),
+                                schedule::publish_at(*d, hour, minute, 0),
+                            ),
+                            None => (None, "сразу".into()),
+                        }
+                    } else {
+                        (None, "сразу".into())
+                    };
+
+                    match upload_one(ctx, target, &plan.pool_cfg, &session, file, publish_at, schedule_on, &mut quota).await {
+                        Ok(id) => {
+                            uploaded += 1;
+                            move_uploaded(file);
+                            record_ok(&mut history, ctx, target, file, &id, &when);
+                            println!("  ✓ {} → {target} → https://youtube.com/watch?v={id}  ({when})", title_of(file));
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            record_err(&mut history, ctx, target, file, &when, &e);
+                            println!("  ✗ {} → {target} — {e:#}", title_of(file));
+                        }
+                    }
+                    let _ = history.save(&ctx.history_file());
+                    let _ = quota.save(&ctx.state_file());
+                }
+            }
+        }
     }
 
     println!("\nЗалито: {uploaded}, ошибок: {failed}");
@@ -371,22 +445,102 @@ pub async fn publish(
     Ok(())
 }
 
+fn hm_of(cfg: &ShortsConfig, ctx: &Context) -> (u32, u32) {
+    match &cfg.publish_at {
+        Some(s) => schedule::parse_hhmm(s),
+        None => (ctx.settings.publish.hour, ctx.settings.publish.minute),
+    }
+}
+
+fn slot_for(
+    schedule_on: bool,
+    days: &[NaiveDate],
+    idx: usize,
+    hour: u32,
+    minute: u32,
+    offset: i64,
+) -> (Option<String>, String) {
+    if !schedule_on {
+        return (None, "сразу".into());
+    }
+    match days.get(idx) {
+        Some(d) => (
+            Some(schedule::publish_at(*d, hour, minute, offset)),
+            schedule::publish_at(*d, hour, minute, 0),
+        ),
+        None => (None, "сразу".into()),
+    }
+}
+
+fn print_plan(
+    label: &str,
+    files: &[PathBuf],
+    take: usize,
+    cfg: &ShortsConfig,
+    now: DateTime<Utc>,
+    _offset: i64,
+) {
+    let schedule_on = cfg.schedule.unwrap_or(false);
+    for (k, f) in files.iter().take(take).enumerate() {
+        let mb = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0) / 1_048_576;
+        if schedule_on {
+            let d = now.date_naive() + Duration::days(k as i64);
+            println!("  [проверка] {label}: {} ({} МБ) → слот {d}", title_of(f), mb);
+        } else {
+            println!("  [проверка] {label}: {} ({} МБ) → сразу", title_of(f), mb);
+        }
+    }
+}
+
+async fn session_for(
+    folder: &str,
+    store: &TokenStore,
+    cache: &mut HashMap<String, auth::Session>,
+) -> anyhow::Result<auth::Session> {
+    if let Some(s) = cache.get(folder) {
+        return Ok(s.clone());
+    }
+    let tok = store
+        .get(folder)
+        .ok_or_else(|| anyhow::anyhow!("нет токена для «{folder}»"))?;
+    let mut tm = TokenManager::new(tok);
+    let s = tm.session().await?;
+    cache.insert(folder.to_string(), s.clone());
+    Ok(s)
+}
+
+async fn occupied_slots(session: &auth::Session, folder: &str) -> Vec<String> {
+    match auth::channel_info(session).await {
+        Ok(info) => match schedule::occupied_slots(session, &info.uploads_playlist).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("shorts[{folder}]: не прочитал занятые слоты: {e}");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!("shorts[{folder}]: не получил info канала: {e}");
+            Vec::new()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn upload_one(
     ctx: &Context,
-    ch: &ShortsChannel,
+    folder: &str,
+    cfg: &ShortsConfig,
     session: &auth::Session,
     file: &Path,
     publish_at: Option<String>,
     schedule_on: bool,
     quota: &mut crate::youtube::quota::QuotaState,
 ) -> anyhow::Result<String> {
-    // диагностика: вертикальное ли видео (шортс = 9:16)
     if let Some((w, h)) = probe_wh(ctx, file) {
         if w >= h {
             tracing::warn!(
-                "shorts[{}]: {} — горизонтальное {w}x{h}, YouTube может не показать как шортс",
-                ch.folder, title_of(file)
+                "shorts[{folder}]: {} — горизонтальное {w}x{h}, YouTube может не показать как шортс",
+                title_of(file)
             );
         }
     }
@@ -396,28 +550,22 @@ async fn upload_one(
         .charge("videos.insert", a.insert_bucket_per_day, a.general_units_per_day, a.quota_warn_percent)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // отложка требует private + publishAt
     let privacy = if schedule_on {
         "private".to_string()
     } else {
-        ch.cfg.privacy.clone().unwrap_or_else(|| "public".into())
+        cfg.privacy.clone().unwrap_or_else(|| "public".into())
     };
 
-    let title = title_of(file);
     let body = api::InsertBody {
         snippet: api::SnippetBody {
-            title,
-            description: ch.cfg.description.clone().unwrap_or_default(),
-            category_id: ch
-                .cfg
-                .category_id
-                .clone()
-                .unwrap_or_else(|| "22".into()),
-            tags: ch.cfg.tags.clone(),
+            title: title_of(file),
+            description: cfg.description.clone().unwrap_or_default(),
+            category_id: cfg.category_id.clone().unwrap_or_else(|| "22".into()),
+            tags: cfg.tags.clone(),
         },
         status: api::StatusBody {
             privacy_status: privacy,
-            made_for_kids: ch.cfg.made_for_kids,
+            made_for_kids: cfg.made_for_kids,
             publish_at,
         },
     };
@@ -434,15 +582,16 @@ async fn upload_one(
         ctx.settings.publish.retry_base_delay_secs,
         |pct| {
             if pct % 25 == 0 {
-                tracing::debug!("shorts[{}] {} {pct}%", ch.folder, title_of(file));
+                tracing::debug!("shorts[{folder}] {} {pct}%", title_of(file));
             }
         },
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     tracing::info!(
-        "shorts[{}]: {} залит ({} МБ), жду обработку YouTube…",
-        ch.folder, title_of(file),
+        "shorts[{folder}]: {} залит ({} МБ), жду обработку YouTube…",
+        title_of(file),
         total / 1_048_576
     );
 
@@ -451,10 +600,55 @@ async fn upload_one(
             .await
             .with_context(|| "YouTube не обработал файл")?;
     } else {
-        // пустой id — нечем проверять, но и не придумываем
-        tracing::warn!("shorts[{}]: пустой id после загрузки", ch.folder);
+        tracing::warn!("shorts[{folder}]: пустой id после загрузки");
     }
     Ok(id)
+}
+
+fn record_ok(history: &mut History, ctx: &Context, folder: &str, file: &Path, id: &str, when: &str) {
+    history.push(HistoryEntry {
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        person: "shorts".into(),
+        channel: folder.to_string(),
+        video_id: id.to_string(),
+        url: format!("https://youtube.com/watch?v={id}"),
+        title: title_of(file),
+        track: file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        picture: String::new(),
+        publish_at: when.to_string(),
+        mode: "Shorts".into(),
+        size_mb: std::fs::metadata(file)
+            .map(|m| m.len() as f64 / 1_048_576.0)
+            .unwrap_or(0.0),
+        render_secs: 0.0,
+        upload_secs: 0.0,
+        thumbnail_fixed: false,
+        error: None,
+    });
+    tracing::info!("shorts[{folder}]: {} залит ({id}), {when}", title_of(file));
+    let _ = ctx;
+}
+
+fn record_err(history: &mut History, ctx: &Context, folder: &str, file: &Path, when: &str, e: &anyhow::Error) {
+    history.push(HistoryEntry {
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        person: "shorts".into(),
+        channel: folder.to_string(),
+        video_id: String::new(),
+        url: String::new(),
+        title: title_of(file),
+        track: file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        picture: String::new(),
+        publish_at: when.to_string(),
+        mode: "Shorts".into(),
+        size_mb: 0.0,
+        render_secs: 0.0,
+        upload_secs: 0.0,
+        thumbnail_fixed: false,
+        error: Some(format!("{e:#}")),
+    });
+    tracing::error!("shorts[{folder}]: {} — {e:#}", title_of(file));
+    let _ = ctx;
 }
 
 fn move_uploaded(file: &Path) {

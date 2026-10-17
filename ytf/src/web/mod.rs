@@ -215,9 +215,11 @@ struct ShortsReq {
     all: bool,
 }
 
-/// Список папок Shorts/ и что в них лежит
+/// Список папок Shorts/ и общий пул
 async fn api_shorts(State(s): State<AppState>) -> impl IntoResponse {
-    let list: Vec<_> = crate::shorts::scan(&s.ctx)
+    let plan = crate::shorts::scan(&s.ctx);
+    let list: Vec<_> = plan
+        .channels
         .into_iter()
         .map(|c| {
             serde_json::json!({
@@ -229,11 +231,22 @@ async fn api_shorts(State(s): State<AppState>) -> impl IntoResponse {
                 "description": c.cfg.description,
                 "tags": c.cfg.tags.len(),
                 "per_run": c.cfg.per_run.unwrap_or(1),
-                "schedule": c.cfg.schedule.unwrap_or(true),
+                "schedule": c.cfg.schedule.unwrap_or(false),
             })
         })
         .collect();
-    Json(serde_json::json!({ "channels": list })).into_response()
+    Json(serde_json::json!({
+        "channels": list,
+        "pool": {
+            "count": plan.pool.len(),
+            "files": plan.pool.iter().take(50).map(|p|
+                p.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>(),
+            "targets": plan.targets,
+            "per_run": plan.pool_cfg.per_run.unwrap_or(1),
+            "schedule": plan.pool_cfg.schedule.unwrap_or(false),
+        }
+    }))
+    .into_response()
 }
 
 async fn api_shorts_publish(

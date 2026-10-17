@@ -91,16 +91,18 @@ a{color:var(--ac)}
       <button class="b" id="shgo" onclick="shPublish('',false)">Залить по 1 на канал</button>
       <button class="b g" id="shall" onclick="shPublish('',true)">Залить всю очередь</button></div>
     <p class="muted" style="margin-top:8px">
-      Готовые вертикальные видео складывай в папку
-      <span class="mono">Shorts/&lt;канал&gt;/</span> (.mp4). По умолчанию
-      <b>«Залить по 1 на канал»</b> берёт одно видео из очереди каждого канала
-      и ставит отложку на ближайший свободный день (как обычные видео) —
-      так 100 видео не вывалятся разом на один канал. «Залить всю очередь» —
-      выгружает всё сразу. Заголовок = имя файла, описание/теги — в
-      <span class="mono">_config.json</span> (там же <span class="mono">per_run</span>,
-      <span class="mono">schedule</span>, <span class="mono">publish_at</span>).
-      Токены общие, из <span class="mono">tokens.json</span>.
+      Два способа: <b>общий пул</b> — <span class="mono">Shorts/_pool/</span>
+      (или файлы прямо в <span class="mono">Shorts/</span>): программа берёт
+      по одному случайному видео на каждый подключённый канал, и 100 роликов
+      расходятся по 10 каналам. Или <b>папка канала</b> —
+      <span class="mono">Shorts/&lt;канал&gt;/</span>. По умолчанию заливается
+      <b>сразу</b> (public), без отложки. Заголовок = имя файла; описание,
+      теги, отложка — в <span class="mono">_config.json</span>.
     </p>
+  </div>
+  <div class="card" id="shpoolcard" style="display:none">
+    <div class="row"><h2 style="margin:0">Общий пул</h2><span class="sp"></span></div>
+    <div id="shpool" class="muted"></div>
   </div>
   <div class="card" style="padding:0;overflow:hidden">
     <table><thead><tr>
@@ -346,10 +348,21 @@ async function loadSh(){
   $('shb').innerHTML='<tr><td colspan=7 class=muted>проверяю…</td></tr>';
   try{
     const r=await fetch('/api/shorts'); const j=await r.json();
+    const p=j.pool||{};
+    if(p.count){
+      $('shpoolcard').style.display='';
+      $('shpool').innerHTML =
+        `<b>${p.count}</b> видео в пуле, распределю по <b>${(p.targets||[]).length}</b> каналам`+
+        (p.schedule?' (с отложкой)':' (сразу)')+
+        `<br>каналы: <span class="mono">${esc((p.targets||[]).join(', '))}</span>`+
+        `<br>файлы: ${(p.files||[]).map(f=>'<span class="pill">'+esc(f)+'</span>').join(' ')}`;
+    } else {
+      $('shpoolcard').style.display='none';
+    }
     $('shb').innerHTML=(j.channels||[]).map(c=>{
       const tok=c.has_token?'<span class="pill y">ок</span>':'<span class="pill n">нет</span>';
       const files=c.files.map(f=>'<span class="pill">'+esc(f)+'</span>').join(' ')||'<span class="muted">—</span>';
-      const sch=c.schedule?'<span class="pill y">да</span>':'<span class="pill w">нет</span>';
+      const sch=c.schedule?'<span class="pill y">да</span>':'<span class="pill w">сразу</span>';
       const per=c.schedule?c.per_run:'все';
       const btn=c.has_token&&c.count
         ? `<button class="b" onclick="shPublish('${esc(c.folder)}',false)">Залить ${c.schedule?c.per_run:''}</button>
@@ -362,14 +375,14 @@ async function loadSh(){
         <td>${sch}</td>
         <td>${tok}</td>
         <td>${btn}</td></tr>`;
-    }).join('') || '<tr><td colspan=7 class=muted>папок Shorts/ нет — создай Shorts/&lt;канал&gt;/ и положи туда .mp4</td></tr>';
+    }).join('') || '<tr><td colspan=7 class=muted>папок каналов нет — используй общий пул Shorts/_pool/</td></tr>';
   }catch(e){ $('shb').innerHTML='<tr><td colspan=7 class=err-t>'+esc(e)+'</td></tr>'; }
 }
 
 async function shPublish(folder,all){
   if(!folder){
-    const msg = all ? 'Залить ВСЮ очередь из всех папок Shorts/?' :
-                      'Залить по 1 видео с каждого канала (с отложкой)?';
+    const msg = all ? 'Залить ВСЮ очередь (пул + папки каналов)?' :
+                      'Залить по 1 видео на каждый канал (пул раскидается по каналам)?';
     if(!confirm(msg)) return;
   }
   $('shgo').disabled=true; $('shall').disabled=true;
