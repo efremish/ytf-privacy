@@ -39,6 +39,25 @@ pub struct ChannelConfig {
 
     /// Пометить видео как «для детей»
     pub made_for_kids: bool,
+
+    /// Авто-шортс: из того же визуала и трека, что и обычное видео.
+    /// По умолчанию выключено.
+    pub auto_shorts: bool,
+
+    /// Когда публиковать авто-шортс:
+    /// `same` — в тот же момент, что и видео; `after` — через
+    /// `shorts_delay_min` минут; `now` — сразу public.
+    pub shorts_when: Option<String>,
+
+    /// Задержка авто-шортса в минутах (для `shorts_when = after`)
+    pub shorts_delay_min: Option<u32>,
+
+    /// Заголовок авто-шортса: `video` — как у видео + #shorts,
+    /// `file` — имя файла. None = `video`.
+    pub shorts_title: Option<String>,
+
+    /// Обрезать авто-шортс до N секунд (None = весь трек)
+    pub shorts_trim_secs: Option<f64>,
 }
 
 impl Default for ChannelConfig {
@@ -54,6 +73,11 @@ impl Default for ChannelConfig {
             publish_at: None,
             category_id: "10".into(),
             made_for_kids: false,
+            auto_shorts: false,
+            shorts_when: None,
+            shorts_delay_min: None,
+            shorts_title: None,
+            shorts_trim_secs: None,
         }
     }
 }

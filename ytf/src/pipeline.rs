@@ -1,4 +1,4 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -343,6 +343,23 @@ async fn run_one(
         _ => false,
     };
 
+    // ── 10b. авто-шортс из того же визуала и трека ──
+    let mut short_note = String::new();
+    if ch.config.auto_shorts && !video_id.is_empty() {
+        match make_auto_short(ctx, renderer, ch, &session, &visual, &track, &meta, &publish_at).await {
+            Ok(Some(id)) => {
+                short_note = format!(" | шортс {id}");
+                tracing::info!("{}/{}: авто-шортс {id}", ch.person, ch.folder);
+                println!("  + авто-шортс: https://youtube.com/watch?v={id}");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("{}/{}: авто-шортс не вышел — {e:#}", ch.person, ch.folder);
+                println!("  [!] авто-шортс не вышел: {e:#}");
+            }
+        }
+    }
+
     // ── 11. журнал ──
     let url = format!("https://youtube.com/watch?v={video_id}");
     history.lock().await.push(HistoryEntry {
@@ -433,6 +450,96 @@ async fn make_thumbnail(r: &Renderer, visual: &Visual) -> Result<Vec<u8>> {
         anyhow::bail!("не собралась обложка: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(out.stdout)
+}
+
+/// Авто-шортс: вертикальная версия того же визуала и трека.
+///
+/// Время публикации:
+/// - `shorts_when = "now"`   — public сразу
+/// - `shorts_when = "same"`  — в тот же момент, что обычное видео (private + publishAt)
+/// - `shorts_when = "after"` — через `shorts_delay_min` минут (по умолчанию 60)
+#[allow(clippy::too_many_arguments)]
+async fn make_auto_short(
+    ctx: &Context,
+    renderer: &Renderer,
+    ch: &crate::config::Channel,
+    session: &auth::Session,
+    visual: &Visual,
+    track: &std::path::Path,
+    meta: &metadata::Metadata,
+    video_publish_at: &str,
+) -> Result<Option<String>> {
+    let when = ch.config.shorts_when.as_deref().unwrap_or("after");
+    let delay = ch.config.shorts_delay_min.unwrap_or(60);
+
+    // publishAt для шортса
+    let (publish_at, label) = match when {
+        "now" => (None, "сразу".to_string()),
+        "same" => (Some(video_publish_at.to_string()), video_publish_at.to_string()),
+        _ => {
+            let base = chrono::DateTime::parse_from_rfc3339(video_publish_at)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let at = base + chrono::Duration::minutes(delay as i64);
+            let s = at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            (Some(s.clone()), s)
+        }
+    };
+
+    let out = ctx.work_dir().join(format!("short_{}_{}.mp4", sanitize(&ch.folder), video_id_suffix()));
+    renderer
+        .render_short_to_file(track, visual, &out, ch.config.shorts_trim_secs)
+        .await?;
+
+    let title = match ch.config.shorts_title.as_deref() {
+        Some("file") => format!("{} #shorts", track.file_stem().unwrap_or_default().to_string_lossy()),
+        _ => {
+            let t = meta.title.trim();
+            if t.to_lowercase().contains("#shorts") {
+                t.to_string()
+            } else {
+                format!("{t} #shorts")
+            }
+        }
+    };
+
+    let body = api::InsertBody {
+        snippet: api::SnippetBody {
+            title,
+            description: meta.description.clone(),
+            category_id: ch.config.category_id.clone(),
+            tags: meta.tags.clone(),
+        },
+        status: api::StatusBody {
+            privacy_status: if publish_at.is_some() { "private".into() } else { "public".into() },
+            made_for_kids: ch.config.made_for_kids,
+            publish_at: publish_at.clone(),
+        },
+    };
+
+    let p = &ctx.settings.publish;
+    let id = upload::upload_file(
+        session,
+        &out,
+        &body,
+        p.upload_retries,
+        p.retry_base_delay_secs,
+        |_| {},
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let _ = std::fs::remove_file(&out);
+    if id.is_empty() {
+        anyhow::bail!("YouTube не вернул id шортса");
+    }
+    api::wait_processed(session, &id, 20, 15).await?;
+    tracing::info!("авто-шортс {id}: {label}");
+    Ok(Some(id))
+}
+
+fn video_id_suffix() -> String {
+    chrono::Local::now().format("%H%M%S").to_string()
 }
 
 /// Проверить обложку YouTube; если чёрная — залить свою
@@ -634,3 +741,4 @@ pub async fn doctor(ctx: &Context) -> Result<()> {
     }
     Ok(())
 }
+

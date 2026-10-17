@@ -183,26 +183,49 @@ pub async fn wait_processed(
     delay_secs: u64,
 ) -> Result<()> {
     let url = format!("{API_BASE}/videos?part=status&id={}", urlenc(video_id));
+    let mut seen_missing = 0u32;
     for i in 0..attempts {
         let r: VideosResp = get_json(session, &url).await?;
-        if let Some(v) = r.items.into_iter().next() {
-            let st = v.status.upload_status.trim().to_ascii_lowercase();
-            match st.as_str() {
-                "processed" | "uploaded" => {
-                    tracing::info!("видео {video_id}: принято YouTube (uploadStatus={st})");
-                    return Ok(());
+        match r.items.into_iter().next() {
+            Some(v) => {
+                seen_missing = 0;
+                let st = v.status.upload_status.trim().to_ascii_lowercase();
+                match st.as_str() {
+                    "processed" | "uploaded" => {
+                        tracing::info!("видео {video_id}: принято YouTube (uploadStatus={st})");
+                        return Ok(());
+                    }
+                    "failed" | "rejected" | "deleted" => {
+                        anyhow::bail!(
+                            "YouTube отклонил файл (uploadStatus={st}) — видео {video_id} битое"
+                        )
+                    }
+                    _ => {
+                        // processing — норма, продолжаем ждать
+                    }
                 }
-                "failed" | "rejected" | "deleted" => {
-                    anyhow::bail!("YouTube отклонил файл (uploadStatus={st}) — видео {video_id} битое")
-                }
-                _ => {
-                    // processing — норма, продолжаем ждать
-                }
+            }
+            None => {
+                // Видео ещё не видно. В норме появляется через несколько
+                // секунд; если его нет все попытки — ролик не создался
+                // (лимит канала, отмена обработки). Раньше тут молча
+                // ждали и рапортовали успех.
+                seen_missing += 1;
+                tracing::warn!(
+                    "видео {video_id}: YouTube его ещё не видит (попытка {}/{attempts})",
+                    i + 1
+                );
             }
         }
         if i + 1 < attempts {
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         }
+    }
+    if seen_missing >= attempts {
+        anyhow::bail!(
+            "видео {video_id} не существует на YouTube — загрузка не принята \
+             (проверь суточный лимит канала и попробуй снова)"
+        );
     }
     anyhow::bail!(
         "видео {video_id} не обработано YouTube за {} мин — файл не принят \

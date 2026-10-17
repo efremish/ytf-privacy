@@ -79,8 +79,9 @@ a{color:var(--ac)}
   <div class="card" style="padding:0;overflow:hidden">
     <table><thead><tr>
       <th>Человек</th><th>Папка</th><th>Канал на YT</th><th>Режим</th>
-      <th>Треки</th><th>Картинки</th><th>Видео</th><th>Использовано</th><th>Токен</th><th></th>
-    </tr></thead><tbody id="chb"><tr><td colspan="10" class="muted">загрузка…</td></tr></tbody></table>
+      <th>Треки</th><th>Картинки</th><th>Видео</th><th>Использовано</th>
+      <th>Авто-шортс</th><th>Токен</th><th></th>
+    </tr></thead><tbody id="chb"><tr><td colspan="11" class="muted">загрузка…</td></tr></tbody></table>
   </div>
 </section>
 
@@ -271,10 +272,13 @@ async function load(){
       <td>${c.music}</td><td>${c.pictures}</td><td>${c.videos}</td>
       <td><div class="bar"><i style="width:${c.music?Math.round(c.used_music/c.music*100):0}%"></i></div>
           <span class="muted">${c.used_music}/${c.music}</span></td>
+      <td>${c.auto_shorts
+            ? `<span class="pill y">вкл</span> <span class="muted">${esc(c.shorts_when==='now'?'сразу':c.shorts_when==='same'?'вместе':'+'+c.shorts_delay_min+' мин')}</span>`
+            : '<span class="pill">выкл</span>'}</td>
       <td>${tok}</td>
       <td>${c.enabled?'':'<span class="pill">выкл</span>'}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan=10 class=muted>каналов нет</td></tr>';
+  }).join('') || '<tr><td colspan=11 class=muted>каналов нет</td></tr>';
 
   fillSet();
 }

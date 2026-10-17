@@ -55,6 +55,8 @@ pub async fn serve(ctx: &Context, host: &str, port: u16) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
+        .route("/report.html", get(report_page))
         .route("/api/state", get(api_state))
         .route("/api/publish", post(api_publish))
         .route("/api/shorts", get(api_shorts))
@@ -79,6 +81,29 @@ fn clone_ctx(ctx: &Context) -> Context {
 
 async fn index() -> Html<&'static str> {
     Html(ui::PAGE)
+}
+
+/// Журнал в HTML — генерируется на месте, если ещё нет
+async fn report_page(State(s): State<AppState>) -> impl IntoResponse {
+    let h = History::load(&s.ctx.history_file());
+    let path = s.ctx.root.join("report.html");
+    match report::write_html(&h, &path) {
+        Ok(()) => match std::fs::read_to_string(&path) {
+            Ok(html) => (StatusCode::OK, Html(html)).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Пустая иконка — иначе браузер сыплет 404 в консоль
+async fn favicon() -> impl IntoResponse {
+    const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0d1117"/><path d="M10 9l12 7-12 7z" fill="#58a6ff"/></svg>"##;
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+        ICON,
+    )
 }
 
 // ── API ───────────────────────────────────────────────────
@@ -130,6 +155,10 @@ async fn api_state(State(s): State<AppState>) -> impl IntoResponse {
                 "has_upload_scope": tok.map(|t| t.has_scope(crate::tokens::SCOPE_UPLOAD)).unwrap_or(false),
                 "publish_at": c.config.publish_at,
                 "release_track": c.config.single_music,
+                "auto_shorts": c.config.auto_shorts,
+                "shorts_when": c.config.shorts_when.clone().unwrap_or_else(|| "after".into()),
+                "shorts_delay_min": c.config.shorts_delay_min.unwrap_or(60),
+                "shorts_trim_secs": c.config.shorts_trim_secs,
                 "ready": c.is_ready(),
                 "used_music": c.music.iter()
                     .filter(|m| used.music.contains_key(
@@ -356,6 +385,8 @@ pub fn router_for(ctx: &Context) -> Router {
     };
     Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
+        .route("/report.html", get(report_page))
         .route("/api/state", get(api_state))
         .route("/api/publish", post(api_publish))
         .route("/api/shorts", get(api_shorts))
@@ -366,3 +397,4 @@ pub fn router_for(ctx: &Context) -> Router {
         .route("/api/used", get(api_used))
         .with_state(state)
 }
+

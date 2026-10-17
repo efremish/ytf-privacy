@@ -232,6 +232,82 @@ impl Renderer {
         Ok(())
     }
 
+    /// Вертикальный шортс (1080×1920) из того же визуала и трека.
+    ///
+    /// Картинка остаётся квадратом по центру (как в обычном видео),
+    /// сверху и снизу — чёрные поля. Длительность — `trim_secs`
+    /// (или весь трек). «Выход из темноты» не дублируем: шортс
+    /// должен начинаться с картинки сразу.
+    pub async fn render_short_to_file(
+        &self,
+        music: &Path,
+        visual: &Visual,
+        dest: &Path,
+        trim_secs: Option<f64>,
+    ) -> Result<()> {
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let (w, h) = (1080u32, 1920u32);
+        let s = w.min(h);
+        // квадрат по центру + поля сверху/снизу
+        let geom = format!(
+            "scale={s}:{s}:force_original_aspect_ratio=increase:flags=lanczos,\
+             crop={s}:{s},\
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+        );
+
+        let mut a: Vec<String> = vec![
+            "-y".into(), "-hide_banner".into(), "-loglevel".into(), "error".into(),
+        ];
+        match visual {
+            Visual::Looped(clip) => {
+                a.push("-stream_loop".into()); a.push("-1".into());
+                a.push("-i".into()); a.push(clip.to_string_lossy().into_owned());
+            }
+            Visual::Still(img) => {
+                a.push("-loop".into()); a.push("1".into());
+                a.push("-i".into()); a.push(img.to_string_lossy().into_owned());
+            }
+        }
+        a.push("-i".into()); a.push(music.to_string_lossy().into_owned());
+        a.push("-vf".into()); a.push(geom);
+        a.push("-r".into()); a.push(self.cfg.fps.to_string());
+        a.push("-c:v".into()); a.push("libx264".into());
+        a.push("-preset".into()); a.push(self.cfg.preset.clone());
+        a.push("-crf".into()); a.push(self.cfg.crf.to_string());
+        a.push("-c:a".into()); a.push("aac".into());
+        a.push("-b:a".into()); a.push(self.cfg.audio_bitrate.clone());
+        a.push("-ar".into()); a.push(self.cfg.audio_rate_hz.to_string());
+        if let Some(t) = trim_secs {
+            if t > 0.5 {
+                a.push("-t".into()); a.push(format!("{t:.2}"));
+            }
+        }
+        a.push("-shortest".into());
+        a.push("-movflags".into()); a.push("+faststart".into());
+        a.push(dest.to_string_lossy().into_owned());
+
+        let out = Command::new(&self.ffmpeg)
+            .args(&a)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .with_context(|| "не запустился ffmpeg (short)")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "ffmpeg (short) завершился с {}:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        if !dest.exists() || std::fs::metadata(dest)?.len() < 1024 {
+            anyhow::bail!("ffmpeg (short) отработал, но файл пустой: {}", dest.display());
+        }
+        Ok(())
+    }
+
     /// Рендер в память: ffmpeg пишет в stdout, мы читаем до конца и
     /// ОБЯЗАТЕЛЬНО проверяем exit code. Потом заливаем одним куском —
     /// этот путь доказанно проходит обработку YouTube.

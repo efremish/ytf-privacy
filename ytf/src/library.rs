@@ -46,7 +46,9 @@ fn load_channel(person: &Path, chan_dir: &Path) -> Result<Channel> {
     let config = match chan_dir.join("_config.json").exists() {
         true => {
             let raw = std::fs::read_to_string(chan_dir.join("_config.json"))?;
-            serde_json::from_str::<ChannelConfig>(&raw)
+            // Блокнот/PowerShell пишут UTF-8 с BOM — serde_json его не ест
+            let raw = raw.trim_start_matches('\u{feff}');
+            serde_json::from_str::<ChannelConfig>(raw)
                 .with_context(|| format!("плохой _config.json в {}", chan_dir.display()))?
         }
         false => ChannelConfig::default(),
