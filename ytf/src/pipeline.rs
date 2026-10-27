@@ -148,8 +148,10 @@ async fn run_one(
     let ch = &job.ch;
 
     // один канал — одно окно: второе окно получит понятную ошибку,
-    // а не станет публиковать тот же канал параллельно
-    let _channel_lock = crate::lock::channel_lock(&ctx.root, &format!("{}/{}", ch.person, ch.folder))
+    // а не станет публиковать тот же канал параллельно.
+    // Ключ — имя папки канала: оно же ключ в tokens.json, поэтому уникально
+    // и совпадает с ключом в shorts.rs (общий лок на публикацию и шортсы).
+    let _channel_lock = crate::lock::channel_lock(&ctx.root, &ch.folder)
         .map_err(|_| anyhow::anyhow!("{}: канал уже публикуется в другом окне программы", ch.label()))?;
 
     // ── 1. канал на YouTube ──
