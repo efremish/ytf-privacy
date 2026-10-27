@@ -44,6 +44,26 @@ impl UsedRegistry {
         *self.music.entry(m).or_insert(0) += 1;
     }
 
+    /// Выбрать трек и сразу записать выбор на диск под локом.
+    ///
+    /// Так два окна программы не выберут один и тот же трек: второе окно
+    /// перечитает `used.json` уже с пометкой первого.
+    pub fn pick_and_note(
+        path: &Path,
+        music: &[std::path::PathBuf],
+        pictures: &[std::path::PathBuf],
+        seed: u64,
+    ) -> Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>> {
+        let _guard = crate::lock::state_lock(path)?;
+        let mut r = Self::load(path);
+        let got = r.pick(music, pictures, seed);
+        if let Some((t, p)) = &got {
+            r.note(t, p.as_deref());
+            r.save(path)?;
+        }
+        Ok(got)
+    }
+
     /// Выбрать трек и картинку, которые ещё не использовались в этой комбинации
     pub fn pick(
         &mut self,
@@ -106,4 +126,49 @@ fn fname(p: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ytf-plan-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn two_windows_do_not_pick_same_track() {
+        let dir = temp_dir("pick");
+        let used = dir.join("used.json");
+        let music: Vec<PathBuf> = (0..20).map(|i| PathBuf::from(format!("t{i}.mp3"))).collect();
+
+        let mut handles = Vec::new();
+        for t in 0..2u64 {
+            let used = used.clone();
+            let music = music.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut got = Vec::new();
+                for i in 0..5u64 {
+                    let (track, _) = UsedRegistry::pick_and_note(&used, &music, &[], t * 100 + i)
+                        .unwrap()
+                        .expect("трек должен найтись");
+                    got.push(track);
+                }
+                got
+            }));
+        }
+
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 10, "два окна выбрали один и тот же трек");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

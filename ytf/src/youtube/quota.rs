@@ -58,6 +58,25 @@ impl QuotaState {
         Ok(())
     }
 
+    /// Списать вызов в общий файл состояния: под локом перечитываем,
+    /// добавляем свой вызов и сохраняем. Так два окна программы видят
+    /// общий счётчик, а не каждый свой.
+    pub fn charge_shared(
+        path: &Path,
+        method: &str,
+        limit_insert: u32,
+        limit_general: u32,
+        warn_pct: u32,
+    ) -> Result<(), String> {
+        let _guard = crate::lock::state_lock(path)
+            .map_err(|e| format!("не смог обновить счётчик квоты: {e}"))?;
+        let mut st = Self::load(path);
+        st.charge(method, limit_insert, limit_general, warn_pct)?;
+        st.save(path)
+            .map_err(|e| format!("не смог сохранить счётчик квоты: {e}"))?;
+        Ok(())
+    }
+
     /// Списать вызов. Возвращает ошибку, если бакет исчерпан
     pub fn charge(&mut self, method: &str, limit_insert: u32, limit_general: u32, warn_pct: u32) -> Result<(), String> {
         if self.date != today() {
@@ -115,4 +134,34 @@ pub async fn print_quota(ctx: &Context) -> Result<()> {
     println!();
     println!("Сброс — 00:00 по Pacific Time.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parallel_charge_counts_every_call() {
+        let dir: PathBuf = std::env::temp_dir().join(format!("ytf-quota-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..5 {
+                    QuotaState::charge_shared(&path, "videos.insert", 100, 10_000, 90).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(QuotaState::load(&path).inserts, 20, "счётчик квоты потерял вызовы");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

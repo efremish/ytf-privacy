@@ -36,8 +36,26 @@ impl History {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let json = serde_json::to_string_pretty(self)?;
+        // Пишем через временный файл: если два окна сохраняют одновременно,
+        // читатель не увидит половину JSON.
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        if std::fs::rename(&tmp, path).is_err() {
+            // На Windows rename поверх существующего файла не работает.
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path)?;
+        }
         Ok(())
+    }
+
+    /// Дописать запись, не затирая чужие: перечитываем файл под локом.
+    /// Нужно, когда работают два окна программы с одной папкой.
+    pub fn append_entry(path: &Path, e: HistoryEntry) -> Result<()> {
+        let _guard = crate::lock::state_lock(path)?;
+        let mut h = History::load(path);
+        h.push(e);
+        h.save(path)
     }
 
     pub fn push(&mut self, e: HistoryEntry) {
@@ -149,5 +167,60 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n - 1).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ytf-hist-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn entry(n: usize) -> HistoryEntry {
+        HistoryEntry {
+            at: "2026-01-01 00:00:00".into(),
+            person: "тест".into(),
+            channel: format!("канал{n}"),
+            video_id: String::new(),
+            url: String::new(),
+            title: format!("видео {n}"),
+            track: format!("t{n}.mp3"),
+            picture: String::new(),
+            publish_at: String::new(),
+            mode: "Random".into(),
+            size_mb: 0.0,
+            render_secs: 0.0,
+            upload_secs: 0.0,
+            thumbnail_fixed: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn parallel_append_keeps_every_entry() {
+        let dir = temp_dir("append");
+        let path = dir.join("history.json");
+
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..10 {
+                    History::append_entry(&path, entry(t * 10 + i)).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(History::load(&path).entries.len(), 40, "часть записей журнала потерялась");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

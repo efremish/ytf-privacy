@@ -24,6 +24,7 @@ pub mod ui;
 pub struct AppState {
     pub ctx: Arc<Context>,
     pub run: Arc<Mutex<RunInfo>>,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +52,7 @@ pub async fn serve(ctx: &Context, host: &str, port: u16) -> anyhow::Result<()> {
     let state = AppState {
         ctx: Arc::new(clone_ctx(ctx)),
         run: Arc::new(Mutex::new(RunInfo::default())),
+        port,
     };
 
     let app = Router::new()
@@ -169,6 +171,7 @@ async fn api_state(State(s): State<AppState>) -> impl IntoResponse {
         .collect();
 
     Json(serde_json::json!({
+        "port": s.port,
         "channels": list,
         "quota": { "inserts": q.inserts, "searches": q.searches, "general": q.general,
                    "insert_limit": s.ctx.settings.api.insert_bucket_per_day,
@@ -382,6 +385,7 @@ pub fn router_for(ctx: &Context) -> Router {
     let state = AppState {
         ctx: Arc::new(clone_ctx(ctx)),
         run: Arc::new(Mutex::new(RunInfo::default())),
+        port: 3000,
     };
     Router::new()
         .route("/", get(index))

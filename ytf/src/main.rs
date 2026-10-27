@@ -1,5 +1,6 @@
 mod config;
 mod library;
+mod lock;
 mod logfile;
 mod media;
 mod metadata;

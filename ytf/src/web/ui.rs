@@ -57,6 +57,7 @@ a{color:var(--ac)}
   <span class="badge" id="q-ins">—</span>
   <span class="badge" id="q-gen">—</span>
   <span class="sp"></span>
+  <span class="badge" id="port">порт —</span>
   <span class="badge" id="st">idle</span>
 </header>
 
@@ -240,6 +241,10 @@ let S=null;
 async function load(){
   const r=await fetch('/api/state'); S=await r.json();
   if(S.error){ $('chb').innerHTML='<tr><td colspan=10 class=err-t>'+esc(S.error)+'</td></tr>'; return; }
+  if(S.port){
+    $('port').textContent='порт '+S.port;
+    document.title='YTF — порт '+S.port;
+  }
 
   $('q-ins').textContent='вставки '+S.quota.inserts+'/'+S.quota.insert_limit;
   $('q-gen').textContent='квота '+S.quota.general+'/'+S.quota.general_limit;

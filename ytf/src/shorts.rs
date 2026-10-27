@@ -271,8 +271,6 @@ pub async fn publish(
     }
 
     let store = TokenStore::load(ctx)?;
-    let mut history = History::load(&ctx.history_file());
-    let mut quota = crate::youtube::quota::QuotaState::load(&ctx.state_file());
     let now = Utc::now();
     let offset = schedule::tz_offset(ctx, None);
     let mut sessions: HashMap<String, auth::Session> = HashMap::new();
@@ -290,6 +288,18 @@ pub async fn publish(
         if ch.pending.is_empty() {
             continue;
         }
+        // канал занимает только одно окно программы
+        let _channel_lock = if no_upload {
+            None
+        } else {
+            match crate::lock::channel_lock(&ctx.root, &ch.folder) {
+                Ok(g) => Some(g),
+                Err(_) => {
+                    println!("  [!] {} — уже публикуется в другом окне, пропускаю", ch.folder);
+                    continue;
+                }
+            }
+        };
         let take = if all {
             ch.pending.len()
         } else {
@@ -338,22 +348,20 @@ pub async fn publish(
 
         for (idx, file) in ch.pending.iter().take(take).enumerate() {
             let (publish_at, when) = slot_for(schedule_on, &days, idx, hour, minute, offset);
-            match upload_one(ctx, &ch.folder, &ch.cfg, &session, file, publish_at, schedule_on, &mut quota).await {
+            match upload_one(ctx, &ch.folder, &ch.cfg, &session, file, publish_at, schedule_on).await {
                 Ok(id) => {
                     uploaded += 1;
                     move_uploaded(file);
-                    record_ok(&mut history, ctx, &ch.folder, file, &id, &when);
+                    record_ok(ctx, &ch.folder, file, &id, &when);
                     println!("  ✓ {} → https://youtube.com/watch?v={id}  ({when})", title_of(file));
                 }
                 Err(e) => {
                     failed += 1;
-                    record_err(&mut history, ctx, &ch.folder, file, &when, &e);
+                    record_err(ctx, &ch.folder, file, &when, &e);
                     println!("  ✗ {} — {e:#}", title_of(file));
                 }
             }
-            let _ = history.save(&ctx.history_file());
         }
-        let _ = quota.save(&ctx.state_file());
     }
 
     // ── 2. общий пул → распределить по каналам ──
@@ -418,21 +426,27 @@ pub async fn publish(
                         (None, "сразу".into())
                     };
 
-                    match upload_one(ctx, target, &plan.pool_cfg, &session, file, publish_at, schedule_on, &mut quota).await {
+                    // канал занимает только одно окно программы
+                    let _lock = match crate::lock::channel_lock(&ctx.root, target) {
+                        Ok(g) => Some(g),
+                        Err(_) => {
+                            println!("  [!] {target} — уже публикуется в другом окне, пропускаю");
+                            continue;
+                        }
+                    };
+                    match upload_one(ctx, target, &plan.pool_cfg, &session, file, publish_at, schedule_on).await {
                         Ok(id) => {
                             uploaded += 1;
                             move_uploaded(file);
-                            record_ok(&mut history, ctx, target, file, &id, &when);
+                            record_ok(ctx, target, file, &id, &when);
                             println!("  ✓ {} → {target} → https://youtube.com/watch?v={id}  ({when})", title_of(file));
                         }
                         Err(e) => {
                             failed += 1;
-                            record_err(&mut history, ctx, target, file, &when, &e);
+                            record_err(ctx, target, file, &when, &e);
                             println!("  ✗ {} → {target} — {e:#}", title_of(file));
                         }
                     }
-                    let _ = history.save(&ctx.history_file());
-                    let _ = quota.save(&ctx.state_file());
                 }
             }
         }
@@ -534,7 +548,6 @@ async fn upload_one(
     file: &Path,
     publish_at: Option<String>,
     schedule_on: bool,
-    quota: &mut crate::youtube::quota::QuotaState,
 ) -> anyhow::Result<String> {
     if let Some((w, h)) = probe_wh(ctx, file) {
         if w >= h {
@@ -546,9 +559,14 @@ async fn upload_one(
     }
 
     let a = &ctx.settings.api;
-    quota
-        .charge("videos.insert", a.insert_bucket_per_day, a.general_units_per_day, a.quota_warn_percent)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::youtube::quota::QuotaState::charge_shared(
+        &ctx.state_file(),
+        "videos.insert",
+        a.insert_bucket_per_day,
+        a.general_units_per_day,
+        a.quota_warn_percent,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let privacy = if schedule_on {
         "private".to_string()
@@ -605,8 +623,8 @@ async fn upload_one(
     Ok(id)
 }
 
-fn record_ok(history: &mut History, ctx: &Context, folder: &str, file: &Path, id: &str, when: &str) {
-    history.push(HistoryEntry {
+fn record_ok(ctx: &Context, folder: &str, file: &Path, id: &str, when: &str) {
+    let entry = HistoryEntry {
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         person: "shorts".into(),
         channel: folder.to_string(),
@@ -624,13 +642,15 @@ fn record_ok(history: &mut History, ctx: &Context, folder: &str, file: &Path, id
         upload_secs: 0.0,
         thumbnail_fixed: false,
         error: None,
-    });
+    };
+    if let Err(e) = History::append_entry(&ctx.history_file(), entry) {
+        tracing::warn!("shorts[{folder}]: журнал не записан — {e:#}");
+    }
     tracing::info!("shorts[{folder}]: {} залит ({id}), {when}", title_of(file));
-    let _ = ctx;
 }
 
-fn record_err(history: &mut History, ctx: &Context, folder: &str, file: &Path, when: &str, e: &anyhow::Error) {
-    history.push(HistoryEntry {
+fn record_err(ctx: &Context, folder: &str, file: &Path, when: &str, e: &anyhow::Error) {
+    let entry = HistoryEntry {
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         person: "shorts".into(),
         channel: folder.to_string(),
@@ -646,9 +666,11 @@ fn record_err(history: &mut History, ctx: &Context, folder: &str, file: &Path, w
         upload_secs: 0.0,
         thumbnail_fixed: false,
         error: Some(format!("{e:#}")),
-    });
+    };
+    if let Err(err) = History::append_entry(&ctx.history_file(), entry) {
+        tracing::warn!("shorts[{folder}]: журнал не записан — {err:#}");
+    }
     tracing::error!("shorts[{folder}]: {} — {e:#}", title_of(file));
-    let _ = ctx;
 }
 
 fn move_uploaded(file: &Path) {

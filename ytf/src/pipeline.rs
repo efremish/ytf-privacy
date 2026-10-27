@@ -8,7 +8,7 @@ use crate::library;
 use crate::media::{Renderer, Rendered, Visual};
 use crate::metadata;
 use crate::plan::UsedRegistry;
-use crate::report::{History, HistoryEntry};
+use crate::report::HistoryEntry;
 use crate::settings::Context;
 use crate::tokens::{ChannelToken, TokenStore};
 use crate::youtube::auth::{self, TokenManager};
@@ -90,11 +90,6 @@ pub async fn publish(
     println!("Публикация в: {:02}:{:02} (Omsk), горизонт {} дн.\n", ctx.settings.publish.hour, ctx.settings.publish.minute, horizon);
 
     let renderer = Renderer::new(ctx)?;
-    let registry = Arc::new(tokio::sync::Mutex::new(UsedRegistry::load(&ctx.used_file())));
-    let history = Arc::new(tokio::sync::Mutex::new(History::load(&ctx.history_file())));
-    let quota = Arc::new(tokio::sync::Mutex::new(
-        crate::youtube::quota::QuotaState::load(&ctx.state_file()),
-    ));
 
     let mut set = tokio::task::JoinSet::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(n));
@@ -102,15 +97,12 @@ pub async fn publish(
     for (i, job) in jobs.into_iter().enumerate() {
         let ctx = ctx.clone();
         let renderer = renderer.clone();
-        let registry = registry.clone();
-        let history = history.clone();
-        let quota = quota.clone();
         let sem = sem.clone();
         set.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
                 return (i, Err(anyhow::anyhow!("не дождался воркера")));
             };
-            let r = run_one(&ctx, &renderer, &job, i, randomize, horizon, no_upload, registry, history, quota).await;
+            let r = run_one(&ctx, &renderer, &job, i, randomize, horizon, no_upload).await;
             (i, r)
         });
     }
@@ -134,15 +126,10 @@ pub async fn publish(
         }
     }
 
-    // сохранить состояние
-    registry.lock().await.save(&ctx.used_file())?;
-    let h = history.lock().await;
-    h.save(&ctx.history_file())?;
-    crate::youtube::quota::QuotaState::load(&ctx.state_file());
-    drop(h);
-    let _ = quota.lock().await.save(&ctx.state_file());
+    // состояние уже сохранено по ходу: used.json — при выборе трека,
+    // history.json — после каждой публикации, state.json — при списании квоты.
 
-    println!("\n{}", crate::report::summary(&History::load(&ctx.history_file())));
+    println!("\n{}", crate::report::summary(&crate::report::History::load(&ctx.history_file())));
     Ok(())
 }
 
@@ -156,12 +143,14 @@ async fn run_one(
     randomize: bool,
     horizon: i64,
     no_upload: bool,
-    registry: Arc<tokio::sync::Mutex<UsedRegistry>>,
-    history: Arc<tokio::sync::Mutex<History>>,
-    quota: Arc<tokio::sync::Mutex<crate::youtube::quota::QuotaState>>,
 ) -> Result<String> {
     let t0 = Instant::now();
     let ch = &job.ch;
+
+    // один канал — одно окно: второе окно получит понятную ошибку,
+    // а не станет публиковать тот же канал параллельно
+    let _channel_lock = crate::lock::channel_lock(&ctx.root, &format!("{}/{}", ch.person, ch.folder))
+        .map_err(|_| anyhow::anyhow!("{}: канал уже публикуется в другом окне программы", ch.label()))?;
 
     // ── 1. канал на YouTube ──
     // в режиме --no-upload токен не нужен: Google не трогаем вообще
@@ -179,11 +168,15 @@ async fn run_one(
 
     // ── 2. квота (в проверке не списываем) ──
     if !no_upload {
-        let mut q = quota.lock().await;
         let a = &ctx.settings.api;
-        if let Err(e) = q.charge("videos.insert", a.insert_bucket_per_day, a.general_units_per_day, a.quota_warn_percent) {
-            anyhow::bail!("{e}");
-        }
+        crate::youtube::quota::QuotaState::charge_shared(
+            &ctx.state_file(),
+            "videos.insert",
+            a.insert_bucket_per_day,
+            a.general_units_per_day,
+            a.quota_warn_percent,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // ── 3. занятые слоты (дата+время) ──
@@ -208,18 +201,15 @@ async fn run_one(
         h.finish()
     };
     let (track, picture) = {
-        let mut r = registry.lock().await;
         let videos = &ch.videos;
         let pics: Vec<PathBuf> = match ch.config.mode {
             RenderMode::Loop => videos.clone(),
             _ => ch.pictures.clone(),
         };
-        let got = r.pick(&ch.music, &pics, seed);
-        match got {
-            Some((t, p)) => {
-                r.note(&t, p.as_deref());
-                (t, p)
-            }
+        // выбор и пометка «использовано» — одной операцией под локом,
+        // чтобы второе окно не взяло тот же трек
+        match UsedRegistry::pick_and_note(&ctx.used_file(), &ch.music, &pics, seed)? {
+            Some(got) => got,
             None => anyhow::bail!("нечего рендерить: нет треков"),
         }
     };
@@ -252,7 +242,7 @@ async fn run_one(
     // ── 8. рендер ──
     let t_render = Instant::now();
     // в режиме --no-upload всегда пишем в файл, чтобы можно было посмотреть результат
-    let out_path = ctx.work_dir().join(format!("{}_{}.mp4", idx, sanitize(&ch.folder)));
+    let out_path = ctx.work_dir().join(format!("{}_{}_{}.mp4", idx, sanitize(&ch.folder), uniq_suffix()));
     let rendered: Rendered = if ctx.settings.publish.stream_to_upload && !no_upload {
         renderer.render_to_memory(&track, &visual).await?
     } else {
@@ -362,7 +352,7 @@ async fn run_one(
 
     // ── 11. журнал ──
     let url = format!("https://youtube.com/watch?v={video_id}");
-    history.lock().await.push(HistoryEntry {
+    let entry = HistoryEntry {
         at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         person: ch.person.clone(),
         channel: ch.label(),
@@ -383,7 +373,11 @@ async fn run_one(
         upload_secs,
         thumbnail_fixed: thumb_fixed,
         error: None,
-    });
+    };
+    // дописываем в файл под локом: второе окно не затрёт запись
+    if let Err(e) = crate::report::History::append_entry(&ctx.history_file(), entry) {
+        tracing::warn!("{}/{}: журнал не записан — {e:#}", ch.person, ch.folder);
+    }
 
     let tail = if video_id.is_empty() {
         String::new()
@@ -486,7 +480,7 @@ async fn make_auto_short(
         }
     };
 
-    let out = ctx.work_dir().join(format!("short_{}_{}.mp4", sanitize(&ch.folder), video_id_suffix()));
+    let out = ctx.work_dir().join(format!("short_{}_{}.mp4", sanitize(&ch.folder), uniq_suffix()));
     renderer
         .render_short_to_file(track, visual, &out, ch.config.shorts_trim_secs)
         .await?;
@@ -538,8 +532,14 @@ async fn make_auto_short(
     Ok(Some(id))
 }
 
-fn video_id_suffix() -> String {
-    chrono::Local::now().format("%H%M%S").to_string()
+fn uniq_suffix() -> String {
+    // pid + случайное: два окна программы не перетрут временные файлы друг друга
+    use rand::Rng;
+    format!(
+        "{}_{:04x}",
+        std::process::id(),
+        rand::thread_rng().gen::<u16>()
+    )
 }
 
 /// Проверить обложку YouTube; если чёрная — залить свою
@@ -623,7 +623,7 @@ pub async fn check_thumb(ctx: &Context, file: &str) -> Result<()> {
     probes.push(("середина".into(), dur / 2.0));
 
     for (label, t) in probes {
-        let tmp = ctx.work_dir().join(format!("chk_{}.jpg", t.round() as i64));
+        let tmp = ctx.work_dir().join(format!("chk_{}_{}.jpg", t.round() as i64, uniq_suffix()));
         if let Err(e) = r.extract_frame(&p, Some(t), &tmp).await {
             println!("  {label:<20} ошибка: {e}");
             continue;

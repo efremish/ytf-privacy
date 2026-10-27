@@ -18,7 +18,8 @@ echo   6. Opublikovat VSE kanaly (publish)
 echo   7. Render bez zagruzki (test)
 echo   8. Zalit shortsy (Shorts\)
 echo   9. Veb-panel (otkroetsya v brauzere)
-echo  10. Vyhod
+echo  10. Vtoroe okno - port 3001 (parallelno)
+echo  11. Vyhod
 echo.
 set /p choice="Vyberi cifru i nazhmi Enter: "
 
@@ -31,7 +32,8 @@ if "%choice%"=="6" goto publish_all
 if "%choice%"=="7" goto dry
 if "%choice%"=="8" goto shorts
 if "%choice%"=="9" goto web
-if "%choice%"=="10" exit
+if "%choice%"=="10" goto web2
+if "%choice%"=="11" exit
 goto menu
 
 :doctor
@@ -142,7 +144,16 @@ goto menu
 
 :web
 cls
+title ytf - port 3000
 start "" http://localhost:3000
 .\ytf.exe web --port 3000
+pause
+goto menu
+
+:web2
+cls
+title ytf - port 3001
+start "" http://localhost:3001
+.\ytf.exe web --port 3001
 pause
 goto menu
