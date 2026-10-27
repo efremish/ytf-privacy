@@ -103,7 +103,8 @@ enum Cmd {
     Web {
         #[arg(long, default_value_t = 3000)]
         port: u16,
-        #[arg(long, default_value = "0.0.0.0")]
+        /// адрес для прослушивания; 0.0.0.0 откроет панель всей сети без пароля
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
 }

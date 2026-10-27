@@ -8,7 +8,7 @@ use super::{ApiError, VideoEntry, API_BASE, UPLOAD_BASE};
 struct PlaylistResp {
     #[serde(default)]
     items: Vec<PlaylistItem>,
-    #[serde(default)]
+    #[serde(default, rename = "nextPageToken")]
     next_page_token: Option<String>,
 }
 
@@ -328,4 +328,18 @@ pub struct StatusBody {
 async fn _unused(s: &Session) -> Result<()> {
     post_json::<_, serde_json::Value>(s, "", &serde_json::json!({})).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playlist_resp_reads_next_page_token() {
+        let r: PlaylistResp = serde_json::from_str(
+            r#"{"items":[{"contentDetails":{"videoId":"abc"}}],"nextPageToken":"CDIQAA"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.next_page_token.as_deref(), Some("CDIQAA"));
+    }
 }

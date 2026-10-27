@@ -234,6 +234,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='his')loadHis();
   if(b.dataset.t==='tok')loadTok();
   if(b.dataset.t==='sh')loadSh();
+  if(b.dataset.t==='set')loadSet();
 });
 
 let S=null;
@@ -291,9 +292,23 @@ async function load(){
 function fillSet(){
   if(!S||!S.publish) return;
   if(document.activeElement && /INPUT|SELECT/.test(document.activeElement.tagName)) return;
-  $('sh').value=S.publish.hour; $('sm').value=S.publish.minute;
-  $('shz').value=S.publish.horizon; $('stz').value=S.publish.timezone||'';
   $('phz').value=S.publish.horizon;
+}
+
+// Вкладка «Настройки» заполняется из полного settings.json, а не из
+// /api/state — иначе незаполненные поля уходят при сохранении нулями.
+async function loadSet(){
+  const r=await fetch('/api/settings'); const c=await r.json();
+  const R=c.render, P=c.publish, A=c.api;
+  $('sh').value=P.hour; $('sm').value=P.minute;
+  $('shz').value=P.horizon_days; $('stz').value=P.timezone||'';
+  $('rw').value=R.width; $('rh').value=R.height; $('rf').value=R.fps; $('rc').value=R.crf;
+  $('rfd').value=R.fade_from_black_secs; $('rbt').value=R.black_frame_threshold;
+  $('rcrop').checked=R.crop_to_fill; $('rseam').checked=R.seamless_loop;
+  $('uret').value=P.upload_retries; $('urd').value=P.retry_base_delay_secs;
+  $('ump').value=A.max_parallel_uploads;
+  $('ustream').checked=P.stream_to_upload; $('uthumb').checked=P.fix_black_thumbnail;
+  $('udel').checked=P.delete_after_upload;
 }
 
 async function publish(){
@@ -309,19 +324,18 @@ async function publish(){
 }
 
 async function saveSet(){
-  const body={
-    render:{width:+$('rw').value,height:+$('rh').value,fps:+$('rf').value,crf:+$('rc').value,
-      preset:'veryfast',audio_bitrate:'160k',audio_rate_hz:44100,
-      fade_from_black_secs:+$('rfd').value,seamless_loop:$('rseam').checked,
-      crop_to_fill:$('rcrop').checked,black_frame_threshold:+$('rbt').value,thumb_at_secs:null},
-    publish:{hour:+$('sh').value,minute:+$('sm').value,timezone:$('stz').value||null,
-      workers:null,upload_retries:+$('uret').value,retry_base_delay_secs:+$('urd').value,
-      fix_black_thumbnail:$('uthumb').checked,delete_after_upload:$('udel').checked,
-      horizon_days:+$('shz').value,stream_to_upload:$('ustream').checked},
-    api:{insert_bucket_per_day:100,general_units_per_day:10000,quota_warn_percent:85,
-      max_parallel_uploads:+$('ump').value},
-    log_level:null
-  };
+  // Берём текущий файл и меняем только поля формы — остальное
+  // (preset, audio_bitrate, лимиты квоты, log_level...) сохраняется как было.
+  const body=await (await fetch('/api/settings')).json();
+  Object.assign(body.render,{width:+$('rw').value,height:+$('rh').value,fps:+$('rf').value,
+    crf:+$('rc').value,fade_from_black_secs:+$('rfd').value,seamless_loop:$('rseam').checked,
+    crop_to_fill:$('rcrop').checked,black_frame_threshold:+$('rbt').value});
+  Object.assign(body.publish,{hour:+$('sh').value,minute:+$('sm').value,
+    timezone:$('stz').value||null,upload_retries:+$('uret').value,
+    retry_base_delay_secs:+$('urd').value,fix_black_thumbnail:$('uthumb').checked,
+    delete_after_upload:$('udel').checked,horizon_days:+$('shz').value,
+    stream_to_upload:$('ustream').checked});
+  body.api.max_parallel_uploads=+$('ump').value;
   const r=await fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)});
   const j=await r.json();
